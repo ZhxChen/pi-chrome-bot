@@ -3,9 +3,11 @@
 A Docker Compose stack that pairs the **[oh-my-pi](https://github.com/can1357/oh-my-pi) (omp)** AI coding agent with a live **Chromium** browser. The agent controls Chrome via the Chrome DevTools Protocol (CDP) while you watch every action in real time through a browser-based desktop.
 
 ```
-Browser tab A → http://localhost:7681    omp TUI (chat with the agent)
-Browser tab B → https://localhost:3001  live Chromium desktop (self-signed HTTPS)
+Browser tab A → http://<host>:7681    omp TUI (chat with the agent)
+Browser tab B → https://<host>:3001  live Chromium desktop (self-signed HTTPS)
 ```
+
+> Replace `<host>` with `localhost` if running locally, or with your server's IP / hostname for remote access.
 
 ## Quick deploy (pre-built image)
 
@@ -22,12 +24,12 @@ curl -fsSL -O https://raw.githubusercontent.com/ZhxChen/pi-chrome-bot/main/docke
 docker compose up -d
 ```
 
-Then open http://localhost:7681, run `/login` inside the TUI to configure your LLM provider, and start chatting with the agent.
+Then open `http://<host>:7681`, run `/login` inside the TUI to configure your LLM provider, and start chatting with the agent.
 
 | URL | What you get |
 |-----|--------------|
-| http://localhost:7681 | omp TUI (chat with the agent) |
-| https://localhost:3001 | Live Chromium desktop (HTTPS, self-signed; accept the cert warning on first visit) |
+| `http://<host>:7681` | omp TUI (chat with the agent) |
+| `https://<host>:3001` | Live Chromium desktop (HTTPS, self-signed; accept the cert warning on first visit) |
 
 **Requirements:** Docker with Compose ≥ 2.23.0. The app image is pulled from `ghcr.io/zhxchen/pi-chrome-bot:latest`.
 
@@ -73,10 +75,10 @@ make build
 make up
 
 # 3. Open the agent TUI in your browser
-open http://localhost:7681
+open http://<host>:7681
 
 # 4. Open the live Chrome desktop in another tab (optional)
-open https://localhost:3001
+open https://<host>:3001
 ```
 
 ### First-time login
@@ -91,7 +93,7 @@ omp saves the credentials to `./data/app` (a bind-mounted volume) and restores t
 
 ## Usage
 
-Once logged in, tell the agent what to do — it will control the Chromium browser you see at `https://localhost:3001`. Examples:
+Once logged in, tell the agent what to do — it will control the Chromium browser you see at `https://<host>:3001`. Examples:
 
 ```
 Search for "Docker multi-arch builds" on Google and summarise the top 3 results.
@@ -119,7 +121,7 @@ All settings live in `docker-compose.dev.yml`. No `.env` file is required.
 
 | Setting | Default | Where |
 |---------|---------|-------|
-| omp version | `16.1.16` | `build.args.OMP_VERSION` |
+| omp version | `16.1.23` | `build.args.OMP_VERSION` |
 | Bun version | `1.3.14` | `build.args.BUN_VERSION` |
 | ttyd version | `1.7.7` | `build.args.TTYD_VERSION` |
 | npm mirror | _(none)_ | `build.args.NPM_REGISTRY` |
