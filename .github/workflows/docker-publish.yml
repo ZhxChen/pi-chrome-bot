@@ -1,0 +1,159 @@
+###############################################################################
+# docker-publish.yml
+#
+# Builds the app image for linux/amd64 and linux/arm64 on GitHub-hosted native
+# runners (no QEMU emulation), then merges them into a single multi-arch
+# manifest and pushes to GitHub Container Registry (ghcr.io).
+#
+# Triggers:
+#   - Push tag v*   →  ghcr.io/<owner>/pi-chrome-bot:v<x.y.z>
+#
+# Keep BUN_VERSION / OMP_VERSION / TTYD_VERSION in sync with docker-compose.dev.yml.
+###############################################################################
+
+name: Build and push Docker image
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+
+env:
+  REGISTRY: ghcr.io
+  # Keep these in sync with the build args in docker-compose.dev.yml.
+  BUN_VERSION: "1.3.14"
+  OMP_VERSION: "16.1.23"
+  TTYD_VERSION: "1.7.7"
+
+jobs:
+  # ── Stage 1: build each platform on a native runner ─────────────────────────
+  build:
+    name: Build (${{ matrix.suffix }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set lowercase image ref
+        run: echo "IMAGE_REF=${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_REF }}
+
+      - name: Build and push (by digest)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            BUN_VERSION=${{ env.BUN_VERSION }}
+            OMP_VERSION=${{ env.OMP_VERSION }}
+            TTYD_VERSION=${{ env.TTYD_VERSION }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Push by digest only — the final manifest tag is created in the merge job.
+          outputs: type=image,name=${{ env.IMAGE_REF }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=build-${{ matrix.suffix }}
+          cache-to: type=gha,scope=build-${{ matrix.suffix }},mode=max
+
+      - name: Record digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.suffix }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Stage 2: merge both digests into a multi-arch manifest ──────────────────
+  merge:
+    name: Merge manifests
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Download digest artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set lowercase image ref
+        run: echo "IMAGE_REF=${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_REF }}
+          tags: |
+            # exact tag name, e.g. v1.2.3
+            type=ref,event=tag
+            # always update latest
+            type=raw,value=latest
+
+      - name: Create and push multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE_REF }}@sha256:%s ' *)
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect \
+            ${{ env.IMAGE_REF }}:${{ steps.meta.outputs.version }}
+
+      - name: Delete untagged package versions
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: pi-chrome-bot
+          package-type: container
+          delete-only-untagged-versions: true
+          token: ${{ secrets.GITHUB_TOKEN }}

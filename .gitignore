@@ -1,0 +1,19 @@
+# Runtime state — persistent volumes from docker compose.
+data/
+
+# Local secrets.
+.env
+
+# Scratch / temp work (tests, debug logs, downloaded tarballs).
+tmp/
+
+# AI assistant config.
+.claude/
+CLAUDE.md
+
+# macOS metadata.
+.DS_Store
+**/.DS_Store
+
+# Editor.
+.vscode/

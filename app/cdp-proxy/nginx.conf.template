@@ -1,0 +1,92 @@
+# nginx config for the cdp-proxy sidecar.
+#
+# What it does:
+#   1. Listen on 0.0.0.0:9222 (accessible from other compose services as
+#      http://chrome:9222 — the sidecar shares chrome's network namespace).
+#   2. Forward both HTTP and WebSocket traffic to chromium's loopback
+#      DevTools endpoint at [::1]:9221.
+#   3. Spoof the `Host` header to `localhost` so chromium accepts the
+#      request (it rejects anything that isn't localhost/IP literal).
+#   4. Rewrite the `webSocketDebuggerUrl` and `devtoolsFrontendUrl` fields
+#      in JSON responses from /json* so Puppeteer's follow-up WebSocket
+#      upgrade comes back through us instead of the unreachable
+#      ws://[::1]:9221 inside chrome's netns.
+#
+# Why this is necessary:
+#   - Chromium 144+ silently forces DevTools to bind only on loopback even
+#     when --remote-debugging-address=0.0.0.0 is passed.
+#   - Chromium's DevTools HTTP server rejects requests whose `Host` header
+#     isn't `localhost` or an IP literal.
+#   - Puppeteer-core consumes `webSocketDebuggerUrl` from /json/version
+#     verbatim, so we have to rewrite it to point back at this proxy.
+
+worker_processes  1;
+events { worker_connections 64; }
+
+http {
+    # Required for WebSocket upgrade through reverse_proxy.
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    upstream chromium_cdp {
+        # Chromium picks one loopback address family at startup (IPv4 in some
+        # containers, IPv6 in others), based on what's available — see
+        # net::IPEndPoint::CreateBoundSocket. Both addresses are valid; only
+        # one is actually serving. We list both and let nginx fail over.
+        # `down` is *not* used because nginx's health check would mark the
+        # silent one down permanently; we want it to retry every request.
+        server 127.0.0.1:9221 max_fails=0;
+        server [::1]:9221     max_fails=0 backup;
+        keepalive 8;
+    }
+
+    server {
+        listen 9222 default_server;
+        listen [::]:9222 default_server;
+
+        # 1) JSON metadata endpoints — rewrite host/port in the body so
+        #    Puppeteer reconnects via us.
+        location ~ ^/json {
+            proxy_pass http://chromium_cdp;
+            proxy_http_version 1.1;
+            proxy_set_header Host localhost;
+
+            # Required for sub_filter to act on JSON.
+            sub_filter_types application/json;
+            sub_filter_once off;
+            # Strip Content-Length so nginx recomputes after sub_filter,
+            # and disable gzip from upstream (chromium doesn't gzip but
+            # belt+suspenders).
+            proxy_set_header Accept-Encoding "";
+
+            # Rewrite all of chromium's possible loopback forms back to
+            # this proxy's externally reachable address. CDP_PUBLIC_HOST
+            # is injected at container start (e.g. chrome:9222).
+            #
+            # Chromium uses the request `Host` header to build the URL in
+            # its response, so since we spoof `Host: localhost`, the body
+            # comes back with `ws://localhost/...` (no port — port 80 is
+            # implicit). We rewrite all forms.
+            sub_filter 'ws://[::1]:9221'     'ws://${CDP_PUBLIC_HOST}';
+            sub_filter 'ws://127.0.0.1:9221' 'ws://${CDP_PUBLIC_HOST}';
+            sub_filter 'ws://localhost:9221' 'ws://${CDP_PUBLIC_HOST}';
+            sub_filter 'ws://localhost/'     'ws://${CDP_PUBLIC_HOST}/';
+            sub_filter 'ws://localhost'      'ws://${CDP_PUBLIC_HOST}';
+        }
+
+        # 2) Everything else (the DevTools WebSocket itself at
+        #    /devtools/browser/<id> and /devtools/page/<id>) — straight
+        #    proxy with Host spoof and WS upgrade.
+        location / {
+            proxy_pass http://chromium_cdp;
+            proxy_http_version 1.1;
+            proxy_set_header Host localhost;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 24h;
+            proxy_send_timeout 24h;
+        }
+    }
+}

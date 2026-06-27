@@ -1,0 +1,141 @@
+###############################################################################
+# pi-chrome-bot — agent + chrome stack
+#
+# Two services on a shared docker bridge network:
+#
+#   chrome  linuxserver/chromium with KasmVNC web desktop and CDP enabled.
+#           Exposes :3001 (browser-based desktop, HTTPS self-signed) to the
+#           host. Exposes cdp-proxy's :9222 (Chrome DevTools Protocol) on the
+#           Docker network — and maps host :9222 for local debugging below.
+#
+#   app     omp (the agent) exposed via ttyd (terminal over HTTP, :7681).
+#           ttyd runs omp's TUI directly; the LLM drives Chrome by passing
+#           `app.cdp_url: "http://chrome:9222"` to the browser tool.
+#
+# Run:
+#   make build          # builds the app image (omp installed from npm)
+#   docker compose up   # start
+#   open http://localhost:7681   # omp TUI in the browser (via ttyd)
+#   open https://localhost:3001  # watch Chrome in a browser (self-signed HTTPS)
+###############################################################################
+
+services:
+  chrome:
+    image: lscr.io/linuxserver/chromium:latest
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      # Timezone for the container's clock and date display (e.g. Chromium's
+      # UI, log timestamps). Defaults to UTC if unset.
+      # - TZ=Asia/Shanghai
+      # Locale controlling language/encoding of system messages and collation.
+      # A CJK locale (zh_CN.UTF-8) keeps Chromium's UI and locale-aware pages
+      # in Chinese; the base image already ships fonts-noto-cjk, so CJK text
+      # renders correctly regardless of this setting.
+      # - LC_ALL=zh_CN.UTF-8
+      # CHROME_CLI passes flags through to Chromium on launch.
+      # --remote-debugging-port: exposes CDP over HTTP on this internal port.
+      #   We intentionally keep Chromium itself off 9222 so the cdp-proxy can
+      #   expose the conventional CDP port on the compose network.
+      # --remote-debugging-address=0.0.0.0: requested, but recent Chromium
+      #   (144+) silently forces loopback regardless. We work around that with
+      #   the `cdp-proxy` sidecar below that re-exposes 127.0.0.1:9221 on
+      #   the shared network as 0.0.0.0:9222.
+      # --remote-allow-origins=*: Chrome 111+ rejects DevTools WebSocket
+      #   connections from non-loopback origins by default. Without this flag
+      #   `puppeteer.connect({ browserURL })` from another host fails with
+      #   "Forbidden". `*` accepts all Origin headers; safe here because the
+      #   port is only reachable on the compose internal network.
+      # --no-first-run: skip the "set as default" wizard so the desktop is
+      #   immediately usable.
+      - CHROME_CLI=--remote-debugging-port=9221 --remote-debugging-address=0.0.0.0 --remote-allow-origins=* --no-first-run
+    ports:
+      # HTTPS — KasmVNC web desktop with a self-signed certificate, accessible
+      # both locally and remotely. Accept the browser security warning on first visit.
+      - "3001:3001"
+      # ── Debug: exposes cdp-proxy's :9222 to the host for local Puppeteer / curl debugging ──
+      # cdp-proxy shares chrome's network namespace, so port mappings must be declared here.
+      # ⚠️ Remove in production — any process that can reach 9222 has full control over Chrome.
+      # - "9222:9222"
+    shm_size: "2gb"   # Chromium crashes intermittently with the default 64m
+    volumes:
+      - ./data/chrome:/config
+
+  # Chromium 144+ silently forces DevTools to bind only on loopback even when
+  # --remote-debugging-address=0.0.0.0 is passed. On top of that, its
+  # DevTools HTTP endpoint validates the `Host` header and rejects anything
+  # that isn't `localhost` or an IP literal — so a TCP-level forward isn't
+  # enough; the Host header has to be rewritten too. And Puppeteer-core
+  # consumes `webSocketDebuggerUrl` from /json/version verbatim, so the body
+  # of those JSON responses has to be rewritten so the WebSocket upgrade
+  # routes back through us instead of chromium's unreachable [::1]:9221.
+  #
+  # This sidecar runs nginx in chrome's network namespace and reverse-proxies
+  # 0.0.0.0:9222 -> [::1]:9221 with Host spoofing + body rewrites for the
+  # /json* metadata endpoints. nginx's `sub_filter` is the simplest engine
+  # available in a stock public image (no third-party caddy modules needed).
+  cdp-proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    network_mode: "service:chrome"
+    environment:
+      # Where this proxy can be reached from the app container. nginx
+      # substitutes ${CDP_PUBLIC_HOST} into nginx.conf.template at start
+      # via envsubst (default behavior of the official nginx-alpine image
+      # when templates live in /etc/nginx/templates/).
+      - CDP_PUBLIC_HOST=chrome:9222
+    volumes:
+      - ./app/cdp-proxy/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    # nginx:alpine's entrypoint runs envsubst on /etc/nginx/templates/*.template
+    # and writes the result to /etc/nginx/conf.d/. But our template is the
+    # full nginx.conf, not just a server{} block, so we override the command
+    # to render directly and run nginx in foreground.
+    command:
+      - sh
+      - -c
+      - |
+        envsubst '$$CDP_PUBLIC_HOST' < /etc/nginx/templates/default.conf.template > /etc/nginx/nginx.conf
+        exec nginx -g 'daemon off;'
+    depends_on:
+      - chrome
+
+
+  app:
+    build:
+      context: ./app
+      args:
+        BUN_VERSION: "1.3.14"
+        OMP_VERSION: "16.1.23"
+        TTYD_VERSION: "1.7.7"
+        # Optional npm mirror — set to https://registry.npmmirror.com if the
+        # build hits transient integrity failures reaching registry.npmjs.org.
+        NPM_REGISTRY: ""
+    image: pi-chrome-bot/app:local
+    restart: unless-stopped
+    environment:
+      # Provider credentials are NOT injected here. The user runs /login in
+      # the TUI once; omp persists credentials to ~/.omp/agent/agent.db,
+      # which lives under the ./data/app:/root volume and survives restarts.
+      # Where the agent should drive the browser. entrypoint.sh surfaces this
+      # in the log; the LLM passes it to the browser tool via app.cdp_url.
+      # Port 9222 is the nginx sidecar that re-exposes chromium's loopback
+      # 9221 onto the docker network — see the cdp-proxy service notes.
+      - PI_DEFAULT_BROWSER_CDP=http://chrome:9222
+      - TZ=Asia/Shanghai
+    ports:
+      # ttyd serves omp's TUI over HTTP/WebSocket on this port.
+      - "7681:7681"
+    volumes:
+      # Persist omp state (sessions, settings, plugins) across restarts.
+      - ./data/app:/root
+      # Persist bun global packages so `omp update` survives container recreates.
+      # Named volume (not bind-mount): Docker auto-populates from image content
+      # on first run, then preserves any `omp update` writes thereafter.
+      # To reset to the image-baked version: docker compose down && docker volume rm pi-chrome-bot_bun_global && docker compose up -d
+      - bun_global:/opt/bun/install/global
+    depends_on:
+      - chrome
+
+volumes:
+  bun_global:

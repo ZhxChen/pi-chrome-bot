@@ -1,0 +1,150 @@
+###############################################################################
+# pi-chrome-bot — deployment file
+#
+# No need to clone the repo; this file alone is enough to deploy the full stack.
+#
+# Quick start:
+#   docker compose pull          # pull the latest images
+#   docker compose up -d         # start all services in the background
+#   open http://localhost:7681   # omp TUI (via ttyd)
+#   open https://localhost:3001  # Chrome remote desktop (KasmVNC, HTTPS self-signed)
+#
+# After first start, run /login in the TUI to configure LLM provider credentials.
+# Credentials are persisted to the ./data/app volume and restored on restart.
+#
+# Data directories (auto-created):
+#   ./data/chrome  — Chrome user data (cookies, bookmarks, extensions)
+#   ./data/app     — omp state, credentials, sessions
+#
+# Updating the image:
+#   docker compose pull && docker compose up -d
+#
+# Requires Docker Compose >= 2.23.0 (configs.content support).
+###############################################################################
+
+services:
+  chrome:
+    image: lscr.io/linuxserver/chromium:latest
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      # Timezone for the container's clock and date display (e.g. Chromium's
+      # UI, log timestamps). Defaults to UTC if unset.
+      # - TZ=Asia/Shanghai
+      # Locale controlling language/encoding of system messages and collation.
+      # A CJK locale (zh_CN.UTF-8) keeps Chromium's UI and locale-aware pages
+      # in Chinese; the base image already ships fonts-noto-cjk, so CJK text
+      # renders correctly regardless of this setting.
+      # - LC_ALL=zh_CN.UTF-8
+      - CHROME_CLI=--remote-debugging-port=9221 --remote-debugging-address=0.0.0.0 --remote-allow-origins=* --no-first-run
+    ports:
+      # HTTPS — KasmVNC web desktop with a self-signed certificate, accessible
+      # both locally and remotely. Accept the browser security warning on first visit.
+      - "3001:3001"
+      # ⚠️ Do NOT enable this in production (any process that can reach 9222
+      #    has full control over Chrome).
+      # - "9222:9222"
+    shm_size: "2gb"
+    volumes:
+      - ./data/chrome:/config
+
+  # Chromium 144+ forces DevTools to bind only on loopback and rejects Host
+  # headers that aren't localhost/an IP literal. This sidecar shares chrome's
+  # network namespace, reverse-proxying [::1]:9221 to 0.0.0.0:9222 while
+  # rewriting the Host header and the WebSocket URLs in response bodies, so
+  # Puppeteer-core can connect to CDP from the app container via
+  # http://chrome:9222.
+  cdp-proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    network_mode: "service:chrome"
+    environment:
+      - CDP_PUBLIC_HOST=chrome:9222
+    configs:
+      - source: cdp_proxy_nginx_tpl
+        target: /etc/nginx/templates/default.conf.template
+    command:
+      - sh
+      - -c
+      - |
+        envsubst '$$CDP_PUBLIC_HOST' < /etc/nginx/templates/default.conf.template > /etc/nginx/nginx.conf
+        exec nginx -g 'daemon off;'
+    depends_on:
+      - chrome
+
+  app:
+    image: ghcr.io/zhxchen/pi-chrome-bot:latest
+    # pull_policy: always  # uncomment to always pull the latest image on `up`
+    restart: unless-stopped
+    environment:
+      - PI_DEFAULT_BROWSER_CDP=http://chrome:9222
+      - TZ=Asia/Shanghai
+    ports:
+      - "7681:7681"
+    volumes:
+      # Persist omp state (credentials, sessions, plugins).
+      - ./data/app:/root
+      # Persist bun global packages so `omp update` survives container recreates.
+      # To reset to the image-baked version:
+      #   docker compose down && docker volume rm <project>_bun_global && docker compose up -d
+      - bun_global:/opt/bun/install/global
+    depends_on:
+      - chrome
+
+volumes:
+  bun_global:
+
+# nginx.conf.template is inlined so users don't need to clone the repo to get
+# this file.
+# $$VAR syntax: Docker Compose escapes $$ to a literal $, which is then
+# processed by envsubst inside the container.
+configs:
+  cdp_proxy_nginx_tpl:
+    content: |
+      worker_processes  1;
+      events { worker_connections 64; }
+
+      http {
+          map $$http_upgrade $$connection_upgrade {
+              default upgrade;
+              ''      close;
+          }
+
+          upstream chromium_cdp {
+              server 127.0.0.1:9221 max_fails=0;
+              server [::1]:9221     max_fails=0 backup;
+              keepalive 8;
+          }
+
+          server {
+              listen 9222 default_server;
+              listen [::]:9222 default_server;
+
+              location ~ ^/json {
+                  proxy_pass http://chromium_cdp;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host localhost;
+
+                  sub_filter_types application/json;
+                  sub_filter_once off;
+                  proxy_set_header Accept-Encoding "";
+
+                  sub_filter 'ws://[::1]:9221'     'ws://$${CDP_PUBLIC_HOST}';
+                  sub_filter 'ws://127.0.0.1:9221' 'ws://$${CDP_PUBLIC_HOST}';
+                  sub_filter 'ws://localhost:9221' 'ws://$${CDP_PUBLIC_HOST}';
+                  sub_filter 'ws://localhost/'     'ws://$${CDP_PUBLIC_HOST}/';
+                  sub_filter 'ws://localhost'      'ws://$${CDP_PUBLIC_HOST}';
+              }
+
+              location / {
+                  proxy_pass http://chromium_cdp;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host localhost;
+                  proxy_set_header Upgrade $$http_upgrade;
+                  proxy_set_header Connection $$connection_upgrade;
+                  proxy_read_timeout 24h;
+                  proxy_send_timeout 24h;
+              }
+          }
+      }
