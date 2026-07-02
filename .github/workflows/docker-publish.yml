@@ -149,11 +149,3 @@ jobs:
         run: |
           docker buildx imagetools inspect \
             ${{ env.IMAGE_REF }}:${{ steps.meta.outputs.version }}
-
-      - name: Delete untagged package versions
-        uses: actions/delete-package-versions@v5
-        with:
-          package-name: pi-chrome-bot
-          package-type: container
-          delete-only-untagged-versions: true
-          token: ${{ secrets.GITHUB_TOKEN }}
