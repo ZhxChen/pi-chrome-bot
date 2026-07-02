@@ -47,9 +47,10 @@ docker compose pull && docker compose up -d
 host
 ├─ :7681  ─►  app container
 │              ├─ ttyd  (terminal over HTTP/WebSocket)
-│              └─ omp   (AI agent TUI)
-│                   └─ browser tool (Puppeteer-core, CDP)
-│                          │
+│              │   └─ tmux client → tmux server (session `webterm`)
+│              │        └─ omp   (AI agent TUI)
+│              │             └─ browser tool (Puppeteer-core, CDP)
+│              │                    │
 └─ :3001  ─►  chrome container (linuxserver/chromium)
                ├─ KasmVNC web desktop  (:3001, HTTPS)
                ├─ Chromium DevTools    (:9221 on [::1] only)  ◄──┐
@@ -59,6 +60,8 @@ host
 ```
 
 The `cdp-proxy` sidecar is necessary because Chromium 144+ forces DevTools to bind only on loopback (`[::1]:9221`) and validates the HTTP `Host` header. The proxy shares Chrome's network namespace, rewrites headers and response bodies, and re-exposes CDP at `0.0.0.0:9222` so the agent container can reach it.
+
+omp runs inside a persistent tmux session (`webterm`) rather than as ttyd's direct child — closing the browser tab does **not** kill the agent. ttyd's child is just the tmux client; omp keeps running under the separate tmux server and the next browser connection re-attaches to the same session. Inside the TUI, `Ctrl-b c` opens a shell window and `Ctrl-b d` detaches (equivalent to closing the tab).
 
 ## Prerequisites
 
@@ -121,11 +124,14 @@ All settings live in `docker-compose.dev.yml`. No `.env` file is required.
 
 | Setting | Default | Where |
 |---------|---------|-------|
-| omp version | `16.1.23` | `build.args.OMP_VERSION` |
+| omp version | `16.3.0` | `build.args.OMP_VERSION` |
 | Bun version | `1.3.14` | `build.args.BUN_VERSION` |
 | ttyd version | `1.7.7` | `build.args.TTYD_VERSION` |
 | npm mirror | _(none)_ | `build.args.NPM_REGISTRY` |
 | Timezone | `Asia/Shanghai` | `environment.TZ` |
+| Locale | `C.UTF-8` | `environment.LANG` / `LC_ALL` (also baked into the image) |
+
+> The `C.UTF-8` locale is required, not cosmetic: omp's tmux session forwards Unicode box-drawing/icons (`╭ π ⬢ 📁`) to the browser only when the locale is UTF-8 — under a POSIX/C locale, tmux downgrades them to ACS escapes and they render as a row of `_`.
 
 To use a custom npm registry (e.g., in mainland China):
 
@@ -139,8 +145,15 @@ build:
 ### Updating omp
 
 ```bash
-# Option A: bump OMP_VERSION in docker-compose.dev.yml, then rebuild
-make build && make up
+# Option A: bump OMP_VERSION in docker-compose.dev.yml, then rebuild.
+# The `bun_global` named volume persists the old install across container
+# recreates, so it must be dropped too — a plain `make build && make up`
+# rebuilds the image but the running container keeps the old omp version.
+make build
+docker compose -f docker-compose.dev.yml stop app
+docker compose -f docker-compose.dev.yml rm -f app
+docker volume rm pi-chrome-bot_bun_global
+make up
 
 # Option B: update in the running container (persists via the bun_global volume)
 docker compose exec app omp update

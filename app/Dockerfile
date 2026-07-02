@@ -31,15 +31,26 @@ ARG TTYD_VERSION
 # (omp) land in /opt/bun/bin. PATH also carries /usr/local/bin (ttyd) and the
 # system path (tini, git, ...).
 ENV BUN_INSTALL=/opt/bun \
-    PATH=/opt/bun/bin:/usr/local/bin:/usr/bin:/bin
+    PATH=/opt/bun/bin:/usr/local/bin:/usr/bin:/bin \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+# UTF-8 locale (C.UTF-8 ships in debian's glibc, no locale-gen needed) is
+# REQUIRED for the ttyd -> tmux -> omp chain. omp always emits Unicode box-
+# drawing and icons (╭ π ⬢ 📁); direct `ttyd omp` passes them through
+# regardless of locale, but when omp runs under tmux, tmux inspects the
+# client process's locale and *downgrades* Unicode line-drawing to DEC ACS
+# escape sequences (ESC(0) when the locale is non-UTF-8 — turning the omp
+# status bar into a row of `_` placeholders. A POSIX/C locale reproduces the
+# bug; LANG=C.UTF-8 makes tmux pass Unicode through verbatim.
 
 # Runtime deps. libssl3 is the TLS lib the prebuilt .node may link (debian-slim
 # doesn't ship it). omp's tools use git (repo ops), sqlite3 (inspect agent.db),
 # openssh-client (git over SSH), ca-certificates (TLS), curl (smoke test),
-# unzip, and tini (PID 1).
+# unzip, tini (PID 1), and tmux (keeps the omp session alive across browser
+# disconnects — see CMD).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git ca-certificates libssl3 sqlite3 openssh-client curl unzip tini \
+        git ca-certificates libssl3 sqlite3 openssh-client curl unzip tini tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # Bun runtime — omp's coding-agent CLI is TypeScript executed via bun.
@@ -104,13 +115,26 @@ RUN ARCH=$(uname -m) \
 
 # Bake AGENTS.md / RULES.md into the image; entrypoint.sh seeds ~/.omp/agent/
 # from /opt/omp-config on each boot so the files survive a volume wipe.
+# tmux.conf is baked to /etc/tmux.conf (system-wide) rather than ~/.tmux.conf
+# because ./data/app:/root bind-mounts over /root at runtime, which would hide
+# any file baked into /root in the image.
 COPY omp-config/ /opt/omp-config/
+COPY tmux.conf /etc/tmux.conf
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 EXPOSE 7681
 
 # tini as PID 1 for proper signal handling; entrypoint runs diagnostics then
-# execs the CMD (ttyd --writable omp).
+# execs the CMD.
+#
+# ttyd spawns `tmux new-session -A -s webterm omp` as its child. That tmux
+# invocation is a *client*: it creates the `webterm` session (running omp) on
+# first connect, and attaches to the existing session on later connects. The
+# omp process lives under a separate tmux *server* daemon, so when the browser
+# disconnects and ttyd tears down its child (the client), the server + omp
+# keep running. Reconnecting re-attaches to the same session — the omp TUI and
+# its in-flight state survive a browser/tab close. When omp itself exits, the
+# session ends; the next connect spawns a fresh omp.
 ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/entrypoint.sh"]
-CMD ["ttyd","--writable","omp"]
+CMD ["ttyd","--writable","tmux","new-session","-A","-s","webterm","omp"]

@@ -9,8 +9,10 @@
 #           Docker network — and maps host :9222 for local debugging below.
 #
 #   app     omp (the agent) exposed via ttyd (terminal over HTTP, :7681).
-#           ttyd runs omp's TUI directly; the LLM drives Chrome by passing
-#           `app.cdp_url: "http://chrome:9222"` to the browser tool.
+#           ttyd runs `tmux new-session -A -s webterm omp`, so omp lives in a
+#           persistent tmux session and survives browser disconnects; the LLM
+#           drives Chrome by passing `app.cdp_url: "http://chrome:9222"` to the
+#           browser tool.
 #
 # Run:
 #   make build          # builds the app image (omp installed from npm)
@@ -106,7 +108,7 @@ services:
       context: ./app
       args:
         BUN_VERSION: "1.3.14"
-        OMP_VERSION: "16.1.23"
+        OMP_VERSION: "16.3.0"
         TTYD_VERSION: "1.7.7"
         # Optional npm mirror — set to https://registry.npmmirror.com if the
         # build hits transient integrity failures reaching registry.npmjs.org.
@@ -123,6 +125,8 @@ services:
       # 9221 onto the docker network — see the cdp-proxy service notes.
       - PI_DEFAULT_BROWSER_CDP=http://chrome:9222
       - TZ=Asia/Shanghai
+      - LANG=C.UTF-8
+      - LC_ALL=C.UTF-8
     ports:
       # ttyd serves omp's TUI over HTTP/WebSocket on this port.
       - "7681:7681"

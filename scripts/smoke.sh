@@ -40,6 +40,9 @@ check "chrome CDP reachable from app container" \
 check "omp binary in app container" \
   "docker compose -f docker-compose.dev.yml exec -T app sh -c 'command -v omp >/dev/null 2>&1'"
 
+check "tmux binary in app container" \
+  "docker compose -f docker-compose.dev.yml exec -T app sh -c 'command -v tmux >/dev/null 2>&1'"
+
 echo
 echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]

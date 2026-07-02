@@ -21,7 +21,7 @@ env:
   REGISTRY: ghcr.io
   # Keep these in sync with the build args in docker-compose.dev.yml.
   BUN_VERSION: "1.3.14"
-  OMP_VERSION: "16.1.23"
+  OMP_VERSION: "16.3.0"
   TTYD_VERSION: "1.7.7"
 
 jobs:

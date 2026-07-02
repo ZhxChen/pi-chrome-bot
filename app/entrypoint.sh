@@ -19,6 +19,14 @@ if ! command -v ttyd >/dev/null 2>&1; then
   exit 127
 fi
 
+# 2b) Sanity: tmux binary is present. ttyd spawns `tmux new-session -A -s
+#     webterm omp`; without tmux the session can't be created and the browser
+#     will fail to attach.
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "entrypoint: \`tmux\` binary missing from PATH" >&2
+  exit 127
+fi
+
 # 3) Seed omp context files from the baked-in omp-config/ directory.
 #    /opt/omp-config is COPYed into the image at build time (see Dockerfile).
 #    We copy *.md into ~/.omp/agent/ on every boot so the files are always
@@ -46,6 +54,7 @@ fi
 # 5) Brief version banner — useful for `docker compose logs app` debugging.
 echo "entrypoint: omp    $(omp --version 2>&1 | head -1 || true)"
 echo "entrypoint: ttyd   $(ttyd --version 2>&1 | head -1 || true)"
+echo "entrypoint: tmux   $(tmux -V 2>&1 | head -1 || true)"
 
 # 6) Provider credentials are NOT injected via environment variables in this
 #    stack. omp's ~/.omp/agent/ directory (including agent.db, which holds

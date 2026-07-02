@@ -80,6 +80,11 @@ services:
     environment:
       - PI_DEFAULT_BROWSER_CDP=http://chrome:9222
       - TZ=Asia/Shanghai
+      # UTF-8 locale — required so tmux forwards omp's Unicode box-drawing
+      # (╭ π ⬢ 📁) to the browser instead of degrading to ACS placeholders.
+      # Also baked into the image's ENV; repeated here for belt-and-suspenders.
+      - LANG=C.UTF-8
+      - LC_ALL=C.UTF-8
     ports:
       - "7681:7681"
     volumes:
