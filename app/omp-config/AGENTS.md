@@ -21,8 +21,9 @@ already-running Chromium instead of launching a new one:
 - `app.target` is a substring on url+title to pick a specific page among
   those Chromium exposes via discovery. Omit it for automatic selection.
 
-The user watches the live desktop at `http://localhost:3000` — drive the
-same browser they see, and they will observe your actions in real time.
+The user watches the live desktop at `https://localhost:3001` (self-signed
+HTTPS) — drive the same browser they see, and they will observe your
+actions in real time.
 
 ## Troubleshooting
 

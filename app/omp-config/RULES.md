@@ -19,6 +19,6 @@
   (`http://chrome:9221`, `http://127.0.0.1:9221`). It is bound on loopback
   inside chrome's network namespace and is unreachable from the app
   container; use the `http://chrome:9222` proxy instead.
-- The user watches the live Chromium desktop at `http://localhost:3000`
-  (KasmVNC web desktop). Drive the same browser the user is looking at —
-  do not spawn a separate headless browser.
+- The user watches the live Chromium desktop at `https://localhost:3001`
+  (KasmVNC web desktop, self-signed HTTPS). Drive the same browser the user
+  is looking at — do not spawn a separate headless browser.
