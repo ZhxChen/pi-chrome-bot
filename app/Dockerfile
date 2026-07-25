@@ -1,140 +1,103 @@
 # syntax=docker/dockerfile:1
 ###############################################################################
-# pi-chrome-bot/app
+# pi-chrome-bot/pi (pi-web UI + native Pi + agent-browser)
 #
-# Installs omp from npm (@oh-my-pi/pi-coding-agent). @oh-my-pi/pi-natives is a
-# dependency of the coding-agent; it declares per-platform optionalDependencies
-# (@oh-my-pi/pi-natives-linux-x64 / -linux-arm64 / ...) that ship a prebuilt
-# .node N-API addon — so no Rust toolchain and no native compile.
-# First build is ~1-2 min (downloads omp + prebuilt natives + ~240 deps).
+# Key components:
+#   - pi + pi-agent-browser-native (Pi package → agent_browser tool)
+#   - agent-browser (global npm CLI and CDP engine)
+#   - @agegr/pi-web (primary UX; standalone Next.js service via pi-web CLI)
 #
-# Adds:
-#   - ttyd binary — serves omp's TUI over HTTP/WebSocket on :7681
-#   - entrypoint.sh — sanity checks + startup diagnostics
+# Global CLIs (pi, agent-browser, pi-web) install under NPM_CONFIG_PREFIX
+# (/opt/npm-global). Compose mounts named volume `npm_global` there so
+# `pi update --self` / `npm update -g` survive container recreates.
 #
-# omp provider credentials are NOT baked in or env-injected. The user runs
-# /login in the TUI once; omp persists them to ~/.omp/agent/agent.db under the
-# ./data/app:/root volume and survives restarts. AGENTS.md / RULES.md are
-# COPYed to /opt/omp-config and seeded into ~/.omp/agent/ by entrypoint.sh on
-# each boot.
-#
-# Update omp: bump OMP_VERSION and rebuild, or `docker compose exec app omp update`.
+# Browser automation: CDP attach only → http://127.0.0.1:9222 (same netns
+# direct connect — this container also runs nginx, terminating TLS on :8443
+# for pi-web/Selkies; see network_mode: service:chrome).
 ###############################################################################
 
 FROM debian:bookworm-slim
 
-ARG BUN_VERSION
-ARG OMP_VERSION
-ARG TTYD_VERSION
+ARG NODE_VERSION=22.23.1
+ARG PI_VERSION=0.82.0
+ARG AGENT_BROWSER_VERSION=0.33.0
+ARG PI_WEB_VERSION=0.8.0
+ARG NPM_REGISTRY=""
 
-# Mirror the upstream pi-base layout: bun lives under /opt/bun and global bins
-# (omp) land in /opt/bun/bin. PATH also carries /usr/local/bin (ttyd) and the
-# system path (tini, git, ...).
-ENV BUN_INSTALL=/opt/bun \
-    PATH=/opt/bun/bin:/usr/local/bin:/usr/bin:/bin \
+ENV NODE_HOME=/opt/node \
+    NPM_CONFIG_PREFIX=/opt/npm-global \
+    PATH=/opt/npm-global/bin:/opt/node/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
-# UTF-8 locale (C.UTF-8 ships in debian's glibc, no locale-gen needed) is
-# REQUIRED for the ttyd -> tmux -> omp chain. omp always emits Unicode box-
-# drawing and icons (╭ π ⬢ 📁); direct `ttyd omp` passes them through
-# regardless of locale, but when omp runs under tmux, tmux inspects the
-# client process's locale and *downgrades* Unicode line-drawing to DEC ACS
-# escape sequences (ESC(0) when the locale is non-UTF-8 — turning the omp
-# status bar into a row of `_` placeholders. A POSIX/C locale reproduces the
-# bug; LANG=C.UTF-8 makes tmux pass Unicode through verbatim.
+    LC_ALL=C.UTF-8 \
+    PI_SEED_DIR=/opt/pi-seed \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
 
-# Runtime deps. libssl3 is the TLS lib the prebuilt .node may link (debian-slim
-# doesn't ship it). omp's tools use git (repo ops), sqlite3 (inspect agent.db),
-# openssh-client (git over SSH), ca-certificates (TLS), curl (smoke test),
-# unzip, tini (PID 1), and tmux (keeps the omp session alive across browser
-# disconnects — see CMD).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git ca-certificates libssl3 sqlite3 openssh-client curl unzip tini tmux \
+        ca-certificates curl git nginx openssh-client openssl sqlite3 tini unzip xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Bun runtime — omp's coding-agent CLI is TypeScript executed via bun.
-# The official install script honors a pre-set BUN_INSTALL, so bun lands in
-# /opt/bun (matching the layout above) rather than the default ~/.bun.
-RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
-    && bun --version
+RUN ARCH=$(uname -m) \
+    && case "$ARCH" in \
+         x86_64)  NODE_ARCH=x64    ;; \
+         aarch64) NODE_ARCH=arm64  ;; \
+         *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
+         -o /tmp/node.tar.xz \
+    && mkdir -p "$NODE_HOME" \
+    && tar -xJf /tmp/node.tar.xz -C "$NODE_HOME" --strip-components=1 \
+    && rm /tmp/node.tar.xz \
+    && node --version && npm --version
 
-# omp from npm. bun's global bin creates an `omp` shim that runs the CLI via
-# bun. @oh-my-pi/pi-natives pulls the matching prebuilt platform optional dep
-# (a .node N-API addon) — no Rust compile. `omp --version` is a load-time
-# smoke check: it forces the natives addon to dlopen, so a missing system
-# lib or arch mismatch fails the build here instead of at runtime.
-#
-# Transient integrity/extraction failures happen when reaching
-# registry.npmjs.org over a flaky link (common in mainland China). Two defenses:
-#   1. NPM_REGISTRY — optional mirror written to bunfig.toml. From China:
-#        --build-arg NPM_REGISTRY=https://registry.npmmirror.com
-#   2. Retry loop — bun caches resolved packages, so later attempts are cheaper.
-ARG NPM_REGISTRY=""
-# Install omp, then (in the SAME RUN layer) strip the speech-input chain so the
-# removed files never enter a lower image layer (a separate rm RUN would leave
-# the 813 MB install layer intact and shrink nothing). omp loads speech via
-# dynamic import() inside try/catch, so removal only disables the TUI "talk
-# instead of type" feature — core CLI, /login, and every tool (incl. browser)
-# are unaffected. Verified: omp --version + browser tool work post-strip.
-# The speech chain is removed unconditionally: this stack runs omp under ttyd,
-# which only tunnels terminal I/O (no audio), and the container has no mic
-# device or recorder binary — so omp's mic→text input cannot work here anyway.
-# (The functional code lives inside omp's bundled cli.js as a lazy module and
-# can't be removed; only its npm deps are stripped.)
 RUN if [ -n "$NPM_REGISTRY" ]; then \
-      printf '[install]\nregistry = "%s"\n' "$NPM_REGISTRY" > "$HOME/.bunfig.toml"; \
-    fi \
+      npm config set registry "$NPM_REGISTRY"; \
+    fi
+
+# Global CLIs → /opt/npm-global (volume-backed at runtime)
+RUN mkdir -p "$NPM_CONFIG_PREFIX" \
     && for i in 1 2 3 4 5; do \
-      if bun install -g @oh-my-pi/pi-coding-agent@${OMP_VERSION}; then break; fi; \
-      echo "omp install attempt $i of 5 failed, retrying in 5s..."; \
+      if npm install -g --ignore-scripts \
+           "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+           "agent-browser@${AGENT_BROWSER_VERSION}" \
+           "@agegr/pi-web@${PI_WEB_VERSION}"; then \
+        break; \
+      fi; \
+      echo "npm global install attempt $i of 5 failed, retrying in 5s..."; \
       [ "$i" -ge 5 ] && exit 1; \
       sleep 5; \
     done \
-    && rm -rf \
-      /opt/bun/install/global/node_modules/onnxruntime-node \
-      /opt/bun/install/global/node_modules/onnxruntime-web \
-      /opt/bun/install/global/node_modules/onnxruntime-common \
-      /opt/bun/install/global/node_modules/@huggingface/transformers \
-      /opt/bun/install/global/node_modules/sherpa-onnx-node \
-      /opt/bun/install/global/node_modules/sherpa-onnx-linux-* \
-    && rm -rf /opt/bun/install/cache \
-    && omp --version
+    && test -x "${NPM_CONFIG_PREFIX}/bin/pi" \
+    && test -x "${NPM_CONFIG_PREFIX}/bin/agent-browser" \
+    && test -x "${NPM_CONFIG_PREFIX}/bin/pi-web" \
+    && pi --version \
+    && agent-browser --version \
+    # pi-web has no --version flag; it starts Next.js — only verify the binary
+    # and that the published package includes prebuilt .next artifacts.
+    && test -d "${NPM_CONFIG_PREFIX}/lib/node_modules/@agegr/pi-web/.next" \
+    && npm cache clean --force
 
-# ttyd — serves the omp TUI over HTTP/WebSocket on :7681.
-RUN ARCH=$(uname -m) \
-    && case "$ARCH" in \
-         aarch64) TTYD_ARCH=aarch64 ;; \
-         x86_64)  TTYD_ARCH=x86_64  ;; \
-         *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
-       esac \
-    && curl -fsSL "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${TTYD_ARCH}" \
-         -o /usr/local/bin/ttyd \
-    && chmod +x /usr/local/bin/ttyd \
-    && ttyd --version
+# Seed pi packages: only browser automation (pi-web is a standalone CLI, not a pi package)
+RUN mkdir -p "${PI_SEED_DIR}/agent" \
+    && PI_CODING_AGENT_DIR="${PI_SEED_DIR}/agent" \
+         pi install "npm:pi-agent-browser-native" \
+    && test -d "${PI_SEED_DIR}/agent/npm" \
+    && test -f "${PI_SEED_DIR}/agent/settings.json" \
+    && echo "seed tree:" \
+    && find "${PI_SEED_DIR}/agent" -maxdepth 4 \( -type d -o -name 'package.json' -o -name 'settings.json' \) | head -80
 
-# Bake AGENTS.md / RULES.md into the image; entrypoint.sh seeds ~/.omp/agent/
-# from /opt/omp-config on each boot so the files survive a volume wipe.
-# tmux.conf is baked to /etc/tmux.conf (system-wide) rather than ~/.tmux.conf
-# because ./data/app:/root bind-mounts over /root at runtime, which would hide
-# any file baked into /root in the image.
-COPY omp-config/ /opt/omp-config/
-COPY tmux.conf /etc/tmux.conf
+COPY pi-config/ /opt/pi-config/
+COPY ingress/nginx.conf.template ingress/widget.css ingress/widget.js.template /opt/pcb-ingress/
+COPY scripts/ensure-tls-cert.sh /usr/local/bin/ensure-tls-cert.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY start-main.sh /usr/local/bin/start-main.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/start-main.sh /usr/local/bin/ensure-tls-cert.sh
 
-EXPOSE 7681
+# 8443 is this container's nginx TLS listener (pi-web/Selkies + widget).
+# 30141/9222 are internal-only; the host port mapping actually
+# lives on the `chrome` compose service, since pi runs with
+# network_mode: service:chrome and shares its network namespace.
+EXPOSE 8443
 
-# tini as PID 1 for proper signal handling; entrypoint runs diagnostics then
-# execs the CMD.
-#
-# ttyd spawns `tmux new-session -A -s webterm omp` as its child. That tmux
-# invocation is a *client*: it creates the `webterm` session (running omp) on
-# first connect, and attaches to the existing session on later connects. The
-# omp process lives under a separate tmux *server* daemon, so when the browser
-# disconnects and ttyd tears down its child (the client), the server + omp
-# keep running. Reconnecting re-attaches to the same session — the omp TUI and
-# its in-flight state survive a browser/tab close. When omp itself exits, the
-# session ends; the next connect spawns a fresh omp.
 ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/entrypoint.sh"]
-CMD ["ttyd","--writable","tmux","new-session","-A","-s","webterm","omp"]
+CMD ["/usr/local/bin/start-main.sh"]

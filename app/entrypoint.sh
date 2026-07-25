@@ -1,68 +1,171 @@
 #!/usr/bin/env bash
-# entrypoint.sh — wraps ttyd (which runs omp) so we can sanity-check the
-# environment and print useful diagnostics before handing off.
-#
-# Exits nonzero with a clear message on misconfiguration; otherwise execs
-# the command passed in (the CMD from the Dockerfile).
+# entrypoint.sh — seed ~/.pi/agent + diagnostics, then exec CMD (start-main → pi-web).
 
 set -euo pipefail
 
-# 1) Sanity: omp binary is present.
-if ! command -v omp >/dev/null 2>&1; then
-  echo "entrypoint: \`omp\` binary missing from PATH" >&2
-  exit 127
+PI_SEED_DIR="${PI_SEED_DIR:-/opt/pi-seed}"
+PI_CONFIG_SRC="${PI_CONFIG_SRC:-/opt/pi-config}"
+PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}"
+CDP_URL="http://127.0.0.1:9222"
+
+need() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "entrypoint: \`$1\` binary missing from PATH" >&2
+    exit 127
+  fi
+}
+
+if [ -n "${NPM_CONFIG_PREFIX:-}" ]; then
+  mkdir -p "${NPM_CONFIG_PREFIX}/bin"
+  export PATH="${NPM_CONFIG_PREFIX}/bin:${PATH}"
+  echo "entrypoint: npm global prefix ${NPM_CONFIG_PREFIX} (volume-backed CLIs)"
 fi
 
-# 2) Sanity: ttyd binary is present.
-if ! command -v ttyd >/dev/null 2>&1; then
-  echo "entrypoint: \`ttyd\` binary missing from PATH" >&2
-  exit 127
-fi
+need pi
+need agent-browser
+need pi-web
 
-# 2b) Sanity: tmux binary is present. ttyd spawns `tmux new-session -A -s
-#     webterm omp`; without tmux the session can't be created and the browser
-#     will fail to attach.
-if ! command -v tmux >/dev/null 2>&1; then
-  echo "entrypoint: \`tmux\` binary missing from PATH" >&2
-  exit 127
-fi
+mkdir -p "$PI_AGENT_DIR"
 
-# 3) Seed omp context files from the baked-in omp-config/ directory.
-#    /opt/omp-config is COPYed into the image at build time (see Dockerfile).
-#    We copy *.md into ~/.omp/agent/ on every boot so the files are always
-#    current even after a persistent volume wipe. To update these files, edit
-#    app/omp-config/*.md and rebuild the image (make build).
-OMP_AGENT_DIR="${HOME}/.omp/agent"
-OMP_CONFIG_SRC="/opt/omp-config"
-if [ -d "$OMP_CONFIG_SRC" ]; then
-  mkdir -p "$OMP_AGENT_DIR"
-  for src in "$OMP_CONFIG_SRC"/*.md; do
+if [ -d "$PI_CONFIG_SRC" ]; then
+  for src in "$PI_CONFIG_SRC"/*; do
     [ -e "$src" ] || continue
-    dest="$OMP_AGENT_DIR/$(basename "$src")"
-    cp "$src" "$dest"
-    echo "entrypoint: refreshed $(basename "$src")"
+    base="$(basename "$src")"
+    dest="$PI_AGENT_DIR/$base"
+    case "$base" in
+      AGENTS.md|SYSTEM.md|APPEND_SYSTEM.md)
+        cp "$src" "$dest"
+        echo "entrypoint: refreshed $base"
+        ;;
+      settings.json) : ;;
+      *)
+        if [ ! -e "$dest" ]; then
+          cp -a "$src" "$dest"
+          echo "entrypoint: seeded $base"
+        fi
+        ;;
+    esac
   done
 fi
 
-# 4) If a CDP target is configured, surface it in the log so users know which
-#    chrome the agent will talk to. The LLM passes it via the browser tool's
-#    `app.cdp_url` argument on each call.
-if [ -n "${PI_DEFAULT_BROWSER_CDP:-}" ]; then
-  echo "entrypoint: agent should target Chrome CDP at ${PI_DEFAULT_BROWSER_CDP}"
+seed_settings="${PI_SEED_DIR}/agent/settings.json"
+cfg_settings="${PI_CONFIG_SRC}/settings.json"
+dest_settings="${PI_AGENT_DIR}/settings.json"
+
+# Ensure browser automation is installed without overriding a user-selected version.
+sync_settings_packages() {
+  local file="$1"
+  node -e '
+    const fs = require("fs");
+    const path = process.argv[1];
+    let s = {};
+    try { s = JSON.parse(fs.readFileSync(path, "utf8")); } catch { s = {}; }
+    if (!Array.isArray(s.packages)) s.packages = [];
+
+    const obsolete = ["pi-package-webui", "@firstpick/pi-package-webui"];
+    const before = s.packages.length;
+    s.packages = s.packages.filter((p) => {
+      const src = typeof p === "string" ? p : (p && p.source) || "";
+      return !obsolete.some((name) => src.includes(name));
+    });
+    if (s.packages.length !== before) {
+      console.log("entrypoint: removed obsolete firstpick webui package entries from settings.json");
+    }
+
+    const hasBrowser = s.packages.some((p) => {
+      const src = typeof p === "string" ? p : (p && p.source) || "";
+      return src.includes("pi-agent-browser-native");
+    });
+    if (!hasBrowser) {
+      s.packages.push("npm:pi-agent-browser-native");
+      console.log("entrypoint: added pi-agent-browser-native to settings.json packages[]");
+    } else {
+      console.log("entrypoint: keeping user-selected pi-agent-browser-native package entry");
+    }
+
+    fs.writeFileSync(path, JSON.stringify(s, null, 2) + "\n");
+  ' "$file"
+}
+
+if [ ! -f "$dest_settings" ]; then
+  if [ -f "$seed_settings" ]; then
+    cp "$seed_settings" "$dest_settings"
+    echo "entrypoint: seeded settings.json from image seed"
+  elif [ -f "$cfg_settings" ]; then
+    cp "$cfg_settings" "$dest_settings"
+    echo "entrypoint: seeded settings.json from /opt/pi-config"
+  else
+    printf '%s\n' "{}" > "$dest_settings"
+    echo "entrypoint: created empty settings.json"
+  fi
+fi
+sync_settings_packages "$dest_settings"
+
+seed_npm="${PI_SEED_DIR}/agent/npm"
+dest_npm="${PI_AGENT_DIR}/npm"
+if [ -d "$seed_npm" ]; then
+  mkdir -p "$dest_npm"
+  for pkg_dir in "$seed_npm"/*; do
+    [ -e "$pkg_dir" ] || continue
+    name="$(basename "$pkg_dir")"
+    if [ ! -e "${dest_npm}/${name}" ]; then
+      cp -a "$pkg_dir" "${dest_npm}/${name}"
+      echo "entrypoint: seeded npm package tree: ${name}"
+    else
+      echo "entrypoint: keeping existing npm package tree: ${name}"
+    fi
+  done
 fi
 
-# 5) Brief version banner — useful for `docker compose logs app` debugging.
-echo "entrypoint: omp    $(omp --version 2>&1 | head -1 || true)"
-echo "entrypoint: ttyd   $(ttyd --version 2>&1 | head -1 || true)"
-echo "entrypoint: tmux   $(tmux -V 2>&1 | head -1 || true)"
+need_install=0
+if ! find "$PI_AGENT_DIR" -type f -path '*/dist/extensions/agent-browser/index.js' 2>/dev/null | grep -q .; then
+  if ! find "$dest_npm" -type f -name 'package.json' 2>/dev/null \
+      | xargs grep -l '"name"[[:space:]]*:[[:space:]]*"pi-agent-browser-native"' >/dev/null 2>&1; then
+    need_install=1
+  fi
+fi
+if [ "$need_install" -eq 1 ]; then
+  echo "entrypoint: installing missing pi-agent-browser-native (needs network)"
+  PI_CODING_AGENT_DIR="$PI_AGENT_DIR" \
+    pi install "npm:pi-agent-browser-native" || \
+    echo "entrypoint: WARNING: pi-agent-browser-native install failed" >&2
+fi
 
-# 6) Provider credentials are NOT injected via environment variables in this
-#    stack. omp's ~/.omp/agent/ directory (including agent.db, which holds
-#    /login credentials) is persisted by the ./data/app:/root volume, so a
-#    single /login in the TUI survives restarts. Built-in providers (e.g.
-#    xiaomi-token-plan-cn) become available once authenticated.
-if ! [ -f "${HOME}/.omp/agent/agent.db" ]; then
-  echo "entrypoint: no stored credentials yet — run /login in the TUI to authenticate a provider"
+if command -v curl >/dev/null 2>&1; then
+  if curl -fsS --max-time 3 "${CDP_URL}/json/version" >/dev/null 2>&1; then
+    echo "entrypoint: CDP probe reached 127.0.0.1:9222"
+  else
+    echo "entrypoint: CDP probe failed on 127.0.0.1:9222 (chrome may still be starting)"
+  fi
+fi
+
+echo "entrypoint: main UX     pi-web  https://<host>:30141/  (via nginx TLS in this container)"
+echo "entrypoint: CDP target  ${CDP_URL}"
+echo "entrypoint: agent tool  agent_browser (pi-agent-browser-native)"
+
+echo "entrypoint: pi              $(pi --version 2>&1 | head -1 || true)"
+# pi-web has no --version; print package.json version if present
+if [ -f "${NPM_CONFIG_PREFIX:-/opt/npm-global}/lib/node_modules/@agegr/pi-web/package.json" ]; then
+  echo "entrypoint: pi-web          $(node -p "require('${NPM_CONFIG_PREFIX:-/opt/npm-global}/lib/node_modules/@agegr/pi-web/package.json').version" 2>/dev/null || echo present)"
+else
+  echo "entrypoint: pi-web          $(command -v pi-web)"
+fi
+echo "entrypoint: agent-browser   $(agent-browser --version 2>&1 | head -1 || true)"
+echo "entrypoint: node            $(node --version 2>&1 | head -1 || true)"
+
+auth_hint=1
+for candidate in \
+  "${PI_AGENT_DIR}/auth.json" \
+  "${HOME}/.pi/agent/auth.json" \
+  "${HOME}/.pi/auth.json"
+do
+  if [ -f "$candidate" ]; then auth_hint=0; break; fi
+done
+if [ -d "${PI_AGENT_DIR}/sessions" ] && [ -n "$(ls -A "${PI_AGENT_DIR}/sessions" 2>/dev/null || true)" ]; then
+  auth_hint=0
+fi
+if [ "$auth_hint" -eq 1 ]; then
+  echo "entrypoint: no credentials yet — configure provider in pi-web (Models/Auth)"
 fi
 
 exec "$@"

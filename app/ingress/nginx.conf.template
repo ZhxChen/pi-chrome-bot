@@ -1,0 +1,86 @@
+# nginx config running inside the pi container: TLS ingress for pi-web, plus
+# a Selkies (VNC) reverse proxy and the "watch the browser" widget
+# injection. Everything here proxies to loopback — pi and chrome share a
+# network namespace (network_mode: service:chrome), so agent-browser talks to
+# Chromium's DevTools directly at http://127.0.0.1:9222 and never passes
+# through this nginx.
+#
+# What it does:
+#   1. Terminate TLS on :8443 (published as host :30141), proxy pi-web, and
+#      inject the browser widget.
+#   2. Serve Selkies under /__pcb/vnc/ from the same HTTPS origin, forwarding
+#      to its loopback-only HTTP endpoint at :3000.
+
+worker_processes  1;
+events { worker_connections 64; }
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # Required for WebSocket upgrade through reverse_proxy.
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    server {
+        listen 8443 ssl default_server;
+        listen [::]:8443 ssl default_server;
+
+        ssl_certificate /etc/nginx/certs/cert.pem;
+        ssl_certificate_key /etc/nginx/certs/key.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        client_max_body_size 10m;
+
+        # Selkies calculates WebSocket paths relative to the current directory.
+        location = /__pcb/vnc {
+            return 308 /__pcb/vnc/;
+        }
+
+        # The trailing slash strips /__pcb/vnc/ before forwarding to Selkies.
+        location ^~ /__pcb/vnc/ {
+            proxy_pass http://127.0.0.1:3000/;
+            proxy_http_version 1.1;
+            proxy_set_header Host localhost;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 24h;
+            proxy_send_timeout 24h;
+            proxy_buffering off;
+        }
+
+        location = /__pcb/widget.css {
+            alias /etc/nginx/templates/widget.css;
+            add_header Cache-Control "no-cache";
+        }
+
+        location = /__pcb/widget.js {
+            alias /etc/nginx/templates/widget.js;
+            add_header Cache-Control "no-cache";
+        }
+
+        location / {
+            proxy_pass http://127.0.0.1:__PI_WEB_PORT__;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 24h;
+            proxy_send_timeout 24h;
+            proxy_set_header Accept-Encoding "";
+            proxy_buffering off;
+
+            sub_filter_types text/html;
+            sub_filter_once on;
+            sub_filter '</body>' '<div id="pcb-widget" style="all:initial"><link rel="stylesheet" href="/__pcb/widget.css?v=2"><button id="pcb-toggle" type="button" title="Live browser view" aria-label="Live browser view"></button><div id="pcb-panel"><div id="pcb-header"><span>Live browser view</span><span id="pcb-controls"><label for="pcb-opacity">Opacity</label><input id="pcb-opacity" type="range" min="5" max="100" value="100" step="1"><output id="pcb-opacity-value" for="pcb-opacity">100%</output><a id="pcb-open" target="_blank" rel="noopener">Open in new tab</a><a href="#" class="pcb-close" id="pcb-close">✕</a></span></div><div id="pcb-body"><iframe id="pcb-iframe" src="about:blank" allow="clipboard-read; clipboard-write"></iframe></div></div></div><script src="/__pcb/widget.js?v=2"></script></body>';
+        }
+    }
+
+}

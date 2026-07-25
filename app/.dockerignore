@@ -1,0 +1,12 @@
+# Keep the pi image build context small and free of host junk.
+# Build context is ./app (see docker-compose*.yml and the publish workflow).
+
+**/.DS_Store
+**/*~
+**/*.swp
+**/.git
+**/tmp
+**/*.pem
+**/*.key
+.env
+.env.*

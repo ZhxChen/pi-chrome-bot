@@ -1,0 +1,43 @@
+// Selkies is served by the proxy under the same HTTPS origin as pi-web.
+(function () {
+  var vncUrl = window.location.origin + "/__pcb/vnc/";
+  var toggle = document.getElementById("pcb-toggle");
+  var panel = document.getElementById("pcb-panel");
+  var iframe = document.getElementById("pcb-iframe");
+  var openLink = document.getElementById("pcb-open");
+  var closeLink = document.getElementById("pcb-close");
+  var opacityInput = document.getElementById("pcb-opacity");
+  var opacityValue = document.getElementById("pcb-opacity-value");
+  var loaded = false;
+  openLink.href = vncUrl;
+
+  toggle.addEventListener("click", function () {
+    var show = panel.style.display !== "block";
+    panel.style.display = show ? "block" : "none";
+    if (show && !loaded) {
+      loaded = true;
+      iframe.src = vncUrl;
+    }
+  });
+
+  closeLink.addEventListener("click", function (e) { e.preventDefault(); panel.style.display = "none"; });
+  opacityInput.addEventListener("input", function () {
+    panel.style.opacity = opacityInput.value / 100;
+    opacityValue.textContent = opacityInput.value + "%";
+  });
+  var dragging = false, startX, startY, startRight, startBottom;
+  document.getElementById("pcb-header").addEventListener("mousedown", function (e) {
+    if (e.target.closest("a, input, label, output")) return;
+    dragging = true; startX = e.clientX; startY = e.clientY;
+    var rect = panel.getBoundingClientRect();
+    startRight = window.innerWidth - rect.right;
+    startBottom = window.innerHeight - rect.bottom;
+    e.preventDefault();
+  });
+  document.addEventListener("mousemove", function (e) {
+    if (!dragging) return;
+    panel.style.right = (startRight - (e.clientX - startX)) + "px";
+    panel.style.bottom = (startBottom - (e.clientY - startY)) + "px";
+  });
+  document.addEventListener("mouseup", function () { dragging = false; });
+})();

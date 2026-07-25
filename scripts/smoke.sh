@@ -1,47 +1,67 @@
 #!/usr/bin/env bash
-# scripts/smoke.sh — port-reachability smoke test.
+# scripts/smoke.sh — pi-web primary stack smoke test.
 #
-# Checks that, after `make up`, the three user-visible surfaces respond:
-#   * ttyd HTTP on :7681 (the omp TUI)
-#   * chrome KasmVNC desktop on :3001 (watch the browser, HTTPS self-signed)
-#   * chrome CDP endpoint, queried from inside the app container to verify the
-#     compose-internal agent path.
+# Surfaces:
+#   * HTTPS pi-web + embedded Selkies on :30141
+#   * CDP from pi container
+#   * binaries + AGENTS.md seed
+#   * soft: agent-browser CDP attach forms
 
 set -euo pipefail
 
-TTYD_PORT="${TTYD_PORT:-7681}"
-CHROME_DESKTOP_PORT="${CHROME_DESKTOP_PORT:-3001}"
+WEBUI_PORT="${WEBUI_PORT:-30141}"
+COMPOSE="${COMPOSE:-docker compose -f docker-compose.dev.yml}"
+CDP_URL="http://127.0.0.1:9222"
 
 pass=0
 fail=0
 
 check() {
-  local label="$1"
-  local cmd="$2"
-  printf '%-50s ' "$label"
+  local label="$1" cmd="$2"
+  printf '%-56s ' "$label"
   if eval "$cmd" >/dev/null 2>&1; then
-    echo "OK"
-    pass=$((pass+1))
+    echo "OK"; pass=$((pass+1))
   else
-    echo "FAIL"
-    fail=$((fail+1))
+    echo "FAIL"; fail=$((fail+1))
   fi
 }
 
-check "ttyd responds on host :${TTYD_PORT}" \
-  "curl -fsS --max-time 5 http://localhost:${TTYD_PORT}/"
+check_soft() {
+  local label="$1" cmd="$2"
+  printf '%-56s ' "$label"
+  if eval "$cmd" >/dev/null 2>&1; then
+    echo "OK"; pass=$((pass+1))
+  else
+    echo "SKIP/FAIL (non-fatal)"
+  fi
+}
 
-check "chrome desktop responds on host :${CHROME_DESKTOP_PORT}" \
-  "curl -fsSk --max-time 5 https://localhost:${CHROME_DESKTOP_PORT}/"
+check "HTTPS pi-web responds on host :${WEBUI_PORT}" \
+  "curl -fskS --max-time 8 https://localhost:${WEBUI_PORT}/"
 
-check "chrome CDP reachable from app container" \
-  "docker compose -f docker-compose.dev.yml exec -T app curl -fsS --max-time 5 http://chrome:9222/json/version"
+check "same-origin Selkies responds under pi-web" \
+  "curl -fskS --max-time 5 https://localhost:${WEBUI_PORT}/__pcb/vnc/"
 
-check "omp binary in app container" \
-  "docker compose -f docker-compose.dev.yml exec -T app sh -c 'command -v omp >/dev/null 2>&1'"
+check "chrome CDP reachable from pi container" \
+  "${COMPOSE} exec -T pi curl -fsS --max-time 5 ${CDP_URL}/json/version"
 
-check "tmux binary in app container" \
-  "docker compose -f docker-compose.dev.yml exec -T app sh -c 'command -v tmux >/dev/null 2>&1'"
+check "pi binary in pi container" \
+  "${COMPOSE} exec -T pi sh -c 'command -v pi >/dev/null 2>&1'"
+
+check "pi-web binary in pi container" \
+  "${COMPOSE} exec -T pi sh -c 'command -v pi-web >/dev/null 2>&1'"
+
+check "agent-browser binary in pi container" \
+  "${COMPOSE} exec -T pi sh -c 'command -v agent-browser >/dev/null 2>&1'"
+
+check "AGENTS.md seeded under ~/.pi/agent" \
+  "${COMPOSE} exec -T pi sh -c 'test -f /root/.pi/agent/AGENTS.md'"
+
+check_soft "agent-browser --cdp http URL (preferred)" \
+  "${COMPOSE} exec -T pi sh -c 'agent-browser --cdp ${CDP_URL} get url'"
+
+check_soft "agent-browser connect http URL" \
+  "${COMPOSE} exec -T pi sh -c 'agent-browser connect ${CDP_URL} >/dev/null && agent-browser get url'"
 
 echo
 echo "passed: $pass  failed: $fail"

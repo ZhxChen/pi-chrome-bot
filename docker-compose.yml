@@ -1,25 +1,36 @@
 ###############################################################################
 # pi-chrome-bot — deployment file
 #
-# No need to clone the repo; this file alone is enough to deploy the full stack.
+# No need to clone the repo; just download this one file and the (optional)
+# certificate helper.
 #
 # Quick start:
-#   docker compose pull          # pull the latest images
-#   docker compose up -d         # start all services in the background
-#   open http://localhost:7681   # omp TUI (via ttyd)
-#   open https://localhost:3001  # Chrome remote desktop (KasmVNC, HTTPS self-signed)
+#   curl -fsSL -O https://raw.githubusercontent.com/ZhxChen/pi-chrome-bot/main/docker-compose.yml
+#   docker compose up -d
+#   open https://192.168.1.10:30141  # pi-web + embedded Chrome
 #
-# After first start, run /login in the TUI to configure LLM provider credentials.
-# Credentials are persisted to the ./data/app volume and restored on restart.
+# On first start, pi auto-generates a self-signed cert into ./data/proxy
+# for localhost by default. Reuse persists across restarts.
+#
+# After first start, authenticate an LLM provider in pi-web (Models/Auth).
+# Credentials are persisted to ./data/app and restored on restart.
 #
 # Data directories (auto-created):
 #   ./data/chrome  — Chrome user data (cookies, bookmarks, extensions)
-#   ./data/app     — omp state, credentials, sessions
+#   ./data/app     — pi state, credentials, sessions (~/.pi)
+#   ./data/proxy   — persistent TLS certificate for the public proxy
 #
-# Updating the image:
+# Updating:
 #   docker compose pull && docker compose up -d
 #
-# Requires Docker Compose >= 2.23.0 (configs.content support).
+# Upgrading from the old 3-service stack: run
+# `docker compose down` first, then `docker compose up -d` with this file.
+# The `cdp-proxy` container disappearing is expected — its TLS/proxy logic
+# now runs inside the `pi` container.
+#
+# Security: the proxy exposes agent and desktop control on all IPv4 interfaces
+# by default. Use a VPN or authenticated reverse proxy and never expose it to
+# untrusted networks.
 ###############################################################################
 
 services:
@@ -29,127 +40,38 @@ services:
     environment:
       - PUID=1000
       - PGID=1000
-      # Timezone for the container's clock and date display (e.g. Chromium's
-      # UI, log timestamps). Defaults to UTC if unset.
       # - TZ=Asia/Shanghai
-      # Locale controlling language/encoding of system messages and collation.
-      # A CJK locale (zh_CN.UTF-8) keeps Chromium's UI and locale-aware pages
-      # in Chinese; the base image already ships fonts-noto-cjk, so CJK text
-      # renders correctly regardless of this setting.
-      # - LC_ALL=zh_CN.UTF-8
-      - CHROME_CLI=--remote-debugging-port=9221 --remote-debugging-address=0.0.0.0 --remote-allow-origins=* --no-first-run
+      - CHROME_CLI=--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=http://localhost --no-first-run
     ports:
-      # HTTPS — KasmVNC web desktop with a self-signed certificate, accessible
-      # both locally and remotely. Accept the browser security warning on first visit.
-      - "3001:3001"
-      # ⚠️ Do NOT enable this in production (any process that can reach 9222
-      #    has full control over Chrome).
-      # - "9222:9222"
+      # pi shares this network namespace. Every published target is pi's
+      # Nginx listener; Chromium's own CDP port has no direct host mapping.
+      # Defaults to all IPv4 interfaces. To make it local-only, use:
+      # - "127.0.0.1:30141:8443"
+      - "30141:8443"
     shm_size: "2gb"
     volumes:
       - ./data/chrome:/config
 
-  # Chromium 144+ forces DevTools to bind only on loopback and rejects Host
-  # headers that aren't localhost/an IP literal. This sidecar shares chrome's
-  # network namespace, reverse-proxying [::1]:9221 to 0.0.0.0:9222 while
-  # rewriting the Host header and the WebSocket URLs in response bodies, so
-  # Puppeteer-core can connect to CDP from the app container via
-  # http://chrome:9222.
-  cdp-proxy:
-    image: nginx:1.27-alpine
+  pi:
+    image: ghcr.io/zhxchen/pi-chrome-bot:latest
+    # pull_policy: always
     restart: unless-stopped
     network_mode: "service:chrome"
     environment:
-      - CDP_PUBLIC_HOST=chrome:9222
-    configs:
-      - source: cdp_proxy_nginx_tpl
-        target: /etc/nginx/templates/default.conf.template
-    command:
-      - sh
-      - -c
-      - |
-        envsubst '$$CDP_PUBLIC_HOST' < /etc/nginx/templates/default.conf.template > /etc/nginx/nginx.conf
-        exec nginx -g 'daemon off;'
-    depends_on:
-      - chrome
-
-  app:
-    image: ghcr.io/zhxchen/pi-chrome-bot:latest
-    # pull_policy: always  # uncomment to always pull the latest image on `up`
-    restart: unless-stopped
-    environment:
-      - PI_DEFAULT_BROWSER_CDP=http://chrome:9222
+      # Optional SAN override for the auto-generated self-signed certificate:
+      # - PUBLIC_HOST=pi-bot.lan
+      - PI_WEB_PORT=30141
       - TZ=Asia/Shanghai
-      # UTF-8 locale — required so tmux forwards omp's Unicode box-drawing
-      # (╭ π ⬢ 📁) to the browser instead of degrading to ACS placeholders.
-      # Also baked into the image's ENV; repeated here for belt-and-suspenders.
-      - LANG=C.UTF-8
-      - LC_ALL=C.UTF-8
-    ports:
-      - "7681:7681"
     volumes:
-      # Persist omp state (credentials, sessions, plugins).
       - ./data/app:/root
-      # Persist bun global packages so `omp update` survives container recreates.
-      # To reset to the image-baked version:
-      #   docker compose down && docker volume rm <project>_bun_global && docker compose up -d
-      - bun_global:/opt/bun/install/global
+      # Persistent TLS certificate for the public proxy.
+      - ./data/proxy:/etc/nginx/certs
+      # Persist npm global CLIs (pi, agent-browser, pi-web). First start
+      # copies image content; later `pi update --self` / `npm update -g` stick.
+      # Reset: docker compose down && docker volume rm <project>_npm_global
+      - npm_global:/opt/npm-global
     depends_on:
       - chrome
 
 volumes:
-  bun_global:
-
-# nginx.conf.template is inlined so users don't need to clone the repo to get
-# this file.
-# $$VAR syntax: Docker Compose escapes $$ to a literal $, which is then
-# processed by envsubst inside the container.
-configs:
-  cdp_proxy_nginx_tpl:
-    content: |
-      worker_processes  1;
-      events { worker_connections 64; }
-
-      http {
-          map $$http_upgrade $$connection_upgrade {
-              default upgrade;
-              ''      close;
-          }
-
-          upstream chromium_cdp {
-              server 127.0.0.1:9221 max_fails=0;
-              server [::1]:9221     max_fails=0 backup;
-              keepalive 8;
-          }
-
-          server {
-              listen 9222 default_server;
-              listen [::]:9222 default_server;
-
-              location ~ ^/json {
-                  proxy_pass http://chromium_cdp;
-                  proxy_http_version 1.1;
-                  proxy_set_header Host localhost;
-
-                  sub_filter_types application/json;
-                  sub_filter_once off;
-                  proxy_set_header Accept-Encoding "";
-
-                  sub_filter 'ws://[::1]:9221'     'ws://$${CDP_PUBLIC_HOST}';
-                  sub_filter 'ws://127.0.0.1:9221' 'ws://$${CDP_PUBLIC_HOST}';
-                  sub_filter 'ws://localhost:9221' 'ws://$${CDP_PUBLIC_HOST}';
-                  sub_filter 'ws://localhost/'     'ws://$${CDP_PUBLIC_HOST}/';
-                  sub_filter 'ws://localhost'      'ws://$${CDP_PUBLIC_HOST}';
-              }
-
-              location / {
-                  proxy_pass http://chromium_cdp;
-                  proxy_http_version 1.1;
-                  proxy_set_header Host localhost;
-                  proxy_set_header Upgrade $$http_upgrade;
-                  proxy_set_header Connection $$connection_upgrade;
-                  proxy_read_timeout 24h;
-                  proxy_send_timeout 24h;
-              }
-          }
-      }
+  npm_global:

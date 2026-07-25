@@ -1,39 +1,33 @@
 # pi-chrome-bot
 
-A Docker Compose stack that pairs the **[oh-my-pi](https://github.com/can1357/oh-my-pi) (omp)** AI coding agent with a live **Chromium** browser. The agent controls Chrome via the Chrome DevTools Protocol (CDP) while you watch every action in real time through a browser-based desktop.
+A Docker Compose stack that pairs the **[Pi](https://pi.dev)** coding agent with **[pi-web](https://github.com/agegr/pi-web)** (`@agegr/pi-web`) as the main browser UX, plus a live **Chromium** for automation via CDP (`agent-browser` + `pi-agent-browser-native`).
 
 ```
-Browser tab A → http://<host>:7681    omp TUI (chat with the agent)
-Browser tab B → https://<host>:3001  live Chromium desktop (self-signed HTTPS)
+Browser tab → https://<host>:30141  pi-web + embedded live Chromium desktop
 ```
 
 > Replace `<host>` with `localhost` if running locally, or with your server's IP / hostname for remote access.
 
+![pi-web chat with the embedded live Chromium desktop panel open](docs/preview.png)
+
 ## Quick deploy (pre-built image)
 
-No need to clone the repository. Create a directory, download [`docker-compose.yml`](docker-compose.yml), and start:
-
 ```bash
-# Create a working directory
 mkdir pi-chrome-bot && cd pi-chrome-bot
-
-# Download the compose file
 curl -fsSL -O https://raw.githubusercontent.com/ZhxChen/pi-chrome-bot/main/docker-compose.yml
-
-# Pull images and start all services
 docker compose up -d
 ```
 
-Then open `http://<host>:7681`, run `/login` inside the TUI to configure your LLM provider, and start chatting with the agent.
+On first start, `pi` auto-generates a self-signed certificate into `./data/proxy` for `PUBLIC_HOST` (default `localhost`). Open `https://<host>:30141` and trust that certificate once. Configure your LLM provider in the Web UI (Models / Auth).
+
+pi-web shows a floating button (bottom-right) that opens a draggable panel embedding the live Chromium desktop. Both pages use the same HTTPS origin, so trusting the main page certificate also lets the iframe load without a second certificate prompt.
 
 | URL | What you get |
 |-----|--------------|
-| `http://<host>:7681` | omp TUI (chat with the agent) |
-| `https://<host>:3001` | Live Chromium desktop (HTTPS, self-signed; accept the cert warning on first visit) |
+| `https://<host>:30141` | **pi-web** and live Chromium desktop |
+| `https://<host>:30141/__pcb/vnc/` | Live Chromium desktop in its own tab |
 
-**Requirements:** Docker with Compose ≥ 2.23.0. The app image is pulled from `ghcr.io/zhxchen/pi-chrome-bot:latest`.
-
-To update to the latest version:
+**Requirements:** Docker with Compose v2. Image: `ghcr.io/zhxchen/pi-chrome-bot:latest`.
 
 ```bash
 docker compose pull && docker compose up -d
@@ -45,130 +39,162 @@ docker compose pull && docker compose up -d
 
 ```
 host
-├─ :7681  ─►  app container
-│              ├─ ttyd  (terminal over HTTP/WebSocket)
-│              │   └─ tmux client → tmux server (session `webterm`)
-│              │        └─ omp   (AI agent TUI)
-│              │             └─ browser tool (Puppeteer-core, CDP)
-│              │                    │
-└─ :3001  ─►  chrome container (linuxserver/chromium)
-               ├─ KasmVNC web desktop  (:3001, HTTPS)
-               ├─ Chromium DevTools    (:9221 on [::1] only)  ◄──┐
-               └─ cdp-proxy sidecar   (:9222 on 0.0.0.0)  ───────┘
-                  nginx reverse-proxy with Host rewriting and
-                  JSON body rewriting for Puppeteer compatibility
+├─ :30141 ─► chrome netns :8443 (TLS, nginx runs inside pi)
+│              ├─ /              → 127.0.0.1:30141 (pi-web + widget)
+│              └─ /__pcb/vnc/    → 127.0.0.1:3000 (Selkies)
+└─ internal only
+               ├─ Chromium DevTools :9222 (loopback)
+               └─ agent-browser ──► http://127.0.0.1:9222 (direct connect)
 ```
 
-The `cdp-proxy` sidecar is necessary because Chromium 144+ forces DevTools to bind only on loopback (`[::1]:9221`) and validates the HTTP `Host` header. The proxy shares Chrome's network namespace, rewrites headers and response bodies, and re-exposes CDP at `0.0.0.0:9222` so the agent container can reach it.
+`pi` runs with `network_mode: service:chrome`, sharing Chrome's network namespace. Its nginx terminates TLS and is the only public ingress. `agent-browser` connects straight to Chromium's DevTools loopback at `http://127.0.0.1:9222` — no proxy rewriting needed, since pi and chrome are in the same netns. Because pi shares Chrome's network namespace, Docker requires host port mappings to be declared on `chrome`, but every published target is an Nginx listener running inside `pi`.
 
-omp runs inside a persistent tmux session (`webterm`) rather than as ttyd's direct child — closing the browser tab does **not** kill the agent. ttyd's child is just the tmux client; omp keeps running under the separate tmux server and the next browser connection re-attaches to the same session. Inside the TUI, `Ctrl-b c` opens a shell window and `Ctrl-b d` detaches (equivalent to closing the tab).
+`@agegr/pi-web` ships as a prebuilt npm package (`.next` artifacts), so nginx rewrites its HTML body (`sub_filter`) to inject a floating button + panel without patching the package. The panel loads `/__pcb/vnc/` from the same origin; Nginx strips this prefix and proxies Selkies over container-local HTTP.
 
-## Prerequisites
+**Closing the pi-web browser tab does not kill the agent** — sessions live in the `pi-web` server process. Re-open `:30141` to continue.
 
-- [Docker](https://docs.docker.com/get-docker/) with Compose v2
-- `make`
-
-## Quick start
+## Quick start (from source)
 
 ```bash
-# 1. Build the app image (downloads omp from npm, ~1-2 min, image ~700 MB)
 make build
-
-# 2. Start all services
 make up
+open https://localhost:30141
+```
 
-# 3. Open the agent TUI in your browser
-open http://<host>:7681
+### Migrating from pi-webui (firstpick)
 
-# 4. Open the live Chrome desktop in another tab (optional)
-open https://<host>:3001
+If you previously ran `@firstpick/pi-package-webui`, drop the named volume once so global CLIs match the new image:
+
+```bash
+docker compose -f docker-compose.dev.yml stop pi
+docker compose -f docker-compose.dev.yml rm -f pi
+docker volume rm pi-chrome-bot_npm_global
+make build && make up
 ```
 
 ### First-time login
 
-Provider credentials are **not** baked into the image. Run `/login` once inside the TUI to authenticate your LLM provider:
-
-```
-/login
-```
-
-omp saves the credentials to `./data/app` (a bind-mounted volume) and restores them automatically on restart. To change the active model, use `/model`.
+Provider credentials are **not** baked into the image. Configure them through **pi-web** Models/Auth. Credentials persist under `./data/app` (`~/.pi`).
 
 ## Usage
 
-Once logged in, tell the agent what to do — it will control the Chromium browser you see at `https://<host>:3001`. Examples:
-
-```
-Search for "Docker multi-arch builds" on Google and summarise the top 3 results.
-Go to github.com/can1357/oh-my-pi and tell me the latest release version.
-```
-
-The agent always attaches to the running browser; it does not launch a separate headless instance.
+Once authenticated, ask the agent to drive Chromium through the embedded desktop via `agent_browser` (CDP attach to `http://127.0.0.1:9222`). Do not launch a second headless Chrome inside the pi container.
 
 ## Make targets
 
 | Command | Description |
 |---------|-------------|
-| `make build` | Build the app image |
-| `make up` | Start all services (`-d`) |
+| `make build` | Build the pi image |
+| `make up` | Start all services |
 | `make down` | Stop all services |
-| `make logs` | Tail logs from all services |
-| `make ps` | Show running containers |
-| `make shell` | Open a shell inside the app container |
-| `make smoke` | Port-reachability smoke test (output in `tmp/smoke.log`) |
-| `make clean` | Stop services, remove volumes, delete the app image |
+| `make logs` | Tail logs |
+| `make ps` | Show containers |
+| `make shell` | Shell in pi |
+| `make smoke` | Smoke test → `tmp/smoke.log` |
+| `make clean` | down -v + remove local image |
 
 ## Configuration
 
-All settings live in `docker-compose.dev.yml`. No `.env` file is required.
-
 | Setting | Default | Where |
 |---------|---------|-------|
-| omp version | `16.3.0` | `build.args.OMP_VERSION` |
-| Bun version | `1.3.14` | `build.args.BUN_VERSION` |
-| ttyd version | `1.7.7` | `build.args.TTYD_VERSION` |
-| npm mirror | _(none)_ | `build.args.NPM_REGISTRY` |
-| Timezone | `Asia/Shanghai` | `environment.TZ` |
-| Locale | `C.UTF-8` | `environment.LANG` / `LC_ALL` (also baked into the image) |
+| Node | `22.23.1` | `build.args.NODE_VERSION` |
+| pi | `0.82.0` | `build.args.PI_VERSION` |
+| agent-browser | `0.33.0` | `build.args.AGENT_BROWSER_VERSION` |
+| pi-agent-browser-native | latest at image build | pi package install |
+| **@agegr/pi-web** | **`0.8.0`** | `build.args.PI_WEB_VERSION` |
+| Public pi-web port | `30141` (HTTPS) | proxy port mapping |
 
-> The `C.UTF-8` locale is required, not cosmetic: omp's tmux session forwards Unicode box-drawing/icons (`╭ π ⬢ 📁`) to the browser only when the locale is UTF-8 — under a POSIX/C locale, tmux downgrades them to ACS escapes and they render as a row of `_`.
+### TLS certificate
 
-To use a custom npm registry (e.g., in mainland China):
-
-```yaml
-# docker-compose.dev.yml
-build:
-  args:
-    NPM_REGISTRY: "https://registry.npmmirror.com"
-```
-
-### Updating omp
+`pi` needs `data/proxy/cert.pem` and `data/proxy/key.pem`. If either is
+missing on startup, it mints and then reuses a self-signed certificate for
+`localhost`:
 
 ```bash
-# Option A: bump OMP_VERSION in docker-compose.dev.yml, then rebuild.
-# The `bun_global` named volume persists the old install across container
-# recreates, so it must be dropped too — a plain `make build && make up`
-# rebuilds the image but the running container keeps the old omp version.
-make build
-docker compose -f docker-compose.dev.yml stop app
-docker compose -f docker-compose.dev.yml rm -f app
-docker volume rm pi-chrome-bot_bun_global
-make up
+docker compose up -d
+```
 
-# Option B: update in the running container (persists via the bun_global volume)
-docker compose exec app omp update
+To generate a self-signed certificate for a LAN IP or DNS name instead, edit
+the `pi.environment` section of the Compose file and uncomment the
+`PUBLIC_HOST` entry, replacing its value with the intended host. Delete the
+existing generated files before recreating `pi`:
+
+```yaml
+environment:
+  - PUBLIC_HOST=pi-bot.lan
+```
+
+```bash
+rm -f data/proxy/cert.pem data/proxy/key.pem
+docker compose up -d --force-recreate pi
+```
+
+Existing files are never overwritten automatically (so browsers only need to
+trust the cert once).
+
+### Use your own certificate
+
+To use a certificate issued by a public or internal CA, place its PEM files in
+the mounted `data/proxy` directory. The certificate must cover the hostname
+used in the browser URL. Use the **full certificate chain** for `cert.pem` and
+an unencrypted PEM private key for `key.pem`:
+
+```bash
+mkdir -p data/proxy
+install -m 644 /path/to/fullchain.pem data/proxy/cert.pem
+install -m 600 /path/to/privkey.pem data/proxy/key.pem
+docker compose up -d --force-recreate pi
+```
+
+For a later renewal, replace both files and restart `pi`:
+
+```bash
+install -m 644 /path/to/new-fullchain.pem data/proxy/cert.pem
+install -m 600 /path/to/new-privkey.pem data/proxy/key.pem
+docker compose restart pi
+```
+
+`data/` is gitignored; keep the private key out of source control and restrict
+host-level access to it. When using a supplied certificate, `PUBLIC_HOST` is
+not needed because nginx serves the supplied files unchanged.
+
+### Updating packages
+
+**Rebuild (pinned versions):** bump build args, then:
+
+```bash
+make build
+docker compose -f docker-compose.dev.yml stop pi
+docker compose -f docker-compose.dev.yml rm -f pi
+docker volume rm pi-chrome-bot_npm_global   # pick up new image CLIs
+make up
+```
+
+**In-container (persists via `npm_global`):**
+
+```bash
+docker compose exec pi npm update -g @agegr/pi-web agent-browser @earendil-works/pi-coding-agent
+# or: docker compose exec pi pi update --self
+docker compose restart pi
 ```
 
 ## Data persistence
 
 | Volume | Path | Contents |
 |--------|------|---------|
-| `./data/app` | `/root` in app container | omp sessions, credentials (`agent.db`), settings |
-| `./data/chrome` | `/config` in chrome container | Chromium profile, cookies, bookmarks |
-| `bun_global` (named) | `/opt/bun/install/global` | Bun global packages (survives `omp update`) |
+| `./data/app` | `/root` | `~/.pi` credentials, sessions, packages |
+| `./data/chrome` | `/config` | Chromium profile |
+| `./data/proxy` | `/etc/nginx/certs` | TLS certificate and private key |
+| `npm_global` | `/opt/npm-global` | Global CLIs: `pi`, `agent-browser`, `pi-web` |
 
-> **Note:** Deleting `data/app/` clears stored credentials — you will need to run `/login` again.
+## Security notes
 
+- Host ports bind to `0.0.0.0` by default. To make the service local-only,
+  change the Compose port mapping to `127.0.0.1:30141:8443`; otherwise place
+  it behind a VPN or an authenticated reverse proxy.
+- Do not map host `:9222` (Chromium DevTools), `:3000`, or Chromium's native `:3001`.
+- The HTTPS proxy exposes agent and desktop control; do not expose it to
+  untrusted networks without strong access control.
 
 ## License
 

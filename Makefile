@@ -1,23 +1,28 @@
-.PHONY: help build up down logs ps shell smoke clean
+.PHONY: help build cert up down logs ps shell smoke clean
 
 COMPOSE ?= docker compose -f docker-compose.dev.yml
 
 help:
 	@echo "Targets:"
-	@echo "  make build       Build the app image (omp installed from npm)"
+	@echo "  make build       Build the pi image (pi + agent-browser + pi-web)"
+	@echo "  make cert        Pre-generate TLS cert for PUBLIC_HOST (optional; pi auto-mints if missing)"
 	@echo "  make up          docker compose up -d"
 	@echo "  make down        docker compose down"
 	@echo "  make logs         Tail logs from all services"
 	@echo "  make ps           Show running services"
-	@echo "  make shell        Open a shell inside the app container"
+	@echo "  make shell        Open a shell inside the pi container"
 	@echo "  make smoke        Port-reachability smoke test (writes to tmp/)"
-	@echo "  make clean        docker compose down + remove the app image"
+	@echo "  make clean        docker compose down + remove the pi image"
+	@echo ""
+	@echo "Main UX:  https://localhost:30141  (pi-web + embedded Chrome)"
 
-# omp is installed from npm inside app/Dockerfile (no separate base image to
-# build). To change any version (BUN_VERSION, OMP_VERSION, TTYD_VERSION),
-# edit the corresponding build arg in docker-compose.dev.yml.
+# Versions are build args in docker-compose.dev.yml. After rebuild, drop
+# npm_global if you need the volume to pick up image-baked CLI versions.
 build:
-	$(COMPOSE) build app
+	$(COMPOSE) build pi
+
+cert:
+	@PUBLIC_HOST="$(or $(PUBLIC_HOST),localhost)" bash scripts/generate-proxy-cert.sh
 
 up:
 	$(COMPOSE) up -d
@@ -32,7 +37,7 @@ ps:
 	$(COMPOSE) ps
 
 shell:
-	$(COMPOSE) exec app bash
+	$(COMPOSE) exec pi bash
 
 smoke:
 	@mkdir -p tmp
@@ -40,4 +45,4 @@ smoke:
 
 clean:
 	-$(COMPOSE) down -v
-	-docker image rm pi-chrome-bot/app:local
+	-docker image rm pi-chrome-bot/pi:local
