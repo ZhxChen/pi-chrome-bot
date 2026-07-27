@@ -41,7 +41,11 @@ services:
       - PUID=1000
       - PGID=1000
       # - TZ=Asia/Shanghai
+      # - LC_ALL=zh_CN.UTF-8
       - CHROME_CLI=--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --remote-allow-origins=http://localhost --no-first-run
+      - SELKIES_MANUAL_WIDTH=1920
+      - SELKIES_MANUAL_HEIGHT=1080
+      - SELKIES_IS_MANUAL_RESOLUTION_MODE=true
     ports:
       # pi shares this network namespace. Every published target is pi's
       # Nginx listener; Chromium's own CDP port has no direct host mapping.

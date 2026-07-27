@@ -1,6 +1,6 @@
 # pi-chrome-bot
 
-A Docker Compose stack that pairs the **[Pi](https://pi.dev)** coding agent with **[pi-web](https://github.com/agegr/pi-web)** (`@agegr/pi-web`) as the main browser UX, plus a live **Chromium** for automation via CDP (`agent-browser` + `pi-agent-browser-native`).
+A Docker Compose stack that pairs the **[Pi](https://pi.dev)** coding agent with **[pi-web](https://github.com/agegr/pi-web)** (`@agegr/pi-web`) as the main browser UX, plus a live **Chromium** for automation via CDP (`agent-browser` + `pi-agent-browser-native`). Prompt scheduling comes from **[pi-schedule-prompt](https://github.com/tintinweb/pi-schedule-prompt)**.
 
 ```
 Browser tab → https://<host>:30141  pi-web + embedded live Chromium desktop
@@ -80,6 +80,27 @@ Provider credentials are **not** baked into the image. Configure them through **
 
 Once authenticated, ask the agent to drive Chromium through the embedded desktop via `agent_browser` (CDP attach to `http://127.0.0.1:9222`). Do not launch a second headless Chrome inside the pi container.
 
+### Scheduled prompts
+
+`pi-schedule-prompt` adds a `schedule_prompt` tool, so the agent can defer or
+repeat its own prompts — "remind me to check this in 20 minutes", "re-check
+that page every 5 minutes". Jobs persist to `<cwd>/.pi/schedule-prompts.json`
+under `./data/app`.
+
+Two limits worth knowing before you rely on it:
+
+- **Nothing is queued.** A job fires only while its Pi session is alive in the
+  `pi-web` process, and pi-web destroys a session after ~10 minutes idle. Short
+  intervals keep themselves alive; a "tomorrow 9am" cron usually will not
+  survive to fire. Restarting the `pi` container drops all live sessions.
+- **Cron takes six fields**, seconds first: `0 * * * * *` is every minute.
+  Hours follow the container `TZ` (`Asia/Shanghai` in the shipped Compose files).
+
+A job with a `model` set runs in a fresh subagent session that loads no
+extensions, so `agent_browser` is absent unless the job also passes
+`extensions: ["agent-browser"]`. Scheduled browser work drives the same
+Chromium you are watching.
+
 ## Make targets
 
 | Command | Description |
@@ -97,11 +118,12 @@ Once authenticated, ask the agent to drive Chromium through the embedded desktop
 
 | Setting | Default | Where |
 |---------|---------|-------|
-| Node | `22.23.1` | `build.args.NODE_VERSION` |
-| pi | `0.82.0` | `build.args.PI_VERSION` |
+| Node | `24.18.0` | `build.args.NODE_VERSION` |
+| pi | `0.82.1` | `build.args.PI_VERSION` |
 | agent-browser | `0.33.0` | `build.args.AGENT_BROWSER_VERSION` |
 | pi-agent-browser-native | latest at image build | pi package install |
-| **@agegr/pi-web** | **`0.8.0`** | `build.args.PI_WEB_VERSION` |
+| pi-schedule-prompt | latest at image build | pi package install |
+| **@agegr/pi-web** | **`0.8.1`** | `build.args.PI_WEB_VERSION` |
 | Public pi-web port | `30141` (HTTPS) | proxy port mapping |
 
 ### TLS certificate
@@ -182,7 +204,7 @@ docker compose restart pi
 
 | Volume | Path | Contents |
 |--------|------|---------|
-| `./data/app` | `/root` | `~/.pi` credentials, sessions, packages |
+| `./data/app` | `/root` | `~/.pi` credentials, sessions, packages, scheduled jobs |
 | `./data/chrome` | `/config` | Chromium profile |
 | `./data/proxy` | `/etc/nginx/certs` | TLS certificate and private key |
 | `npm_global` | `/opt/npm-global` | Global CLIs: `pi`, `agent-browser`, `pi-web` |

@@ -4,6 +4,7 @@
 #
 # Key components:
 #   - pi + pi-agent-browser-native (Pi package → agent_browser tool)
+#   - pi + pi-schedule-prompt (Pi package → schedule_prompt tool)
 #   - agent-browser (global npm CLI and CDP engine)
 #   - @agegr/pi-web (primary UX; standalone Next.js service via pi-web CLI)
 #
@@ -18,10 +19,10 @@
 
 FROM debian:bookworm-slim
 
-ARG NODE_VERSION=22.23.1
-ARG PI_VERSION=0.82.0
+ARG NODE_VERSION=24.18.0
+ARG PI_VERSION=0.82.1
 ARG AGENT_BROWSER_VERSION=0.33.0
-ARG PI_WEB_VERSION=0.8.0
+ARG PI_WEB_VERSION=0.8.1
 ARG NPM_REGISTRY=""
 
 ENV NODE_HOME=/opt/node \
@@ -77,10 +78,13 @@ RUN mkdir -p "$NPM_CONFIG_PREFIX" \
     && test -d "${NPM_CONFIG_PREFIX}/lib/node_modules/@agegr/pi-web/.next" \
     && npm cache clean --force
 
-# Seed pi packages: only browser automation (pi-web is a standalone CLI, not a pi package)
+# Seed pi packages: browser automation + prompt scheduling.
+# (pi-web is a standalone CLI, not a pi package — never install it here.)
 RUN mkdir -p "${PI_SEED_DIR}/agent" \
     && PI_CODING_AGENT_DIR="${PI_SEED_DIR}/agent" \
          pi install "npm:pi-agent-browser-native" \
+    && PI_CODING_AGENT_DIR="${PI_SEED_DIR}/agent" \
+         pi install "npm:pi-schedule-prompt" \
     && test -d "${PI_SEED_DIR}/agent/npm" \
     && test -f "${PI_SEED_DIR}/agent/settings.json" \
     && echo "seed tree:" \

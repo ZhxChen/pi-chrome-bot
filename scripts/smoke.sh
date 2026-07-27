@@ -57,6 +57,12 @@ check "agent-browser binary in pi container" \
 check "AGENTS.md seeded under ~/.pi/agent" \
   "${COMPOSE} exec -T pi sh -c 'test -f /root/.pi/agent/AGENTS.md'"
 
+check "pi packages listed in settings.json" \
+  "${COMPOSE} exec -T pi sh -c 'grep -q pi-agent-browser-native /root/.pi/agent/settings.json && grep -q pi-schedule-prompt /root/.pi/agent/settings.json'"
+
+check "pi-schedule-prompt installed under ~/.pi/agent/npm" \
+  "${COMPOSE} exec -T pi sh -c 'grep -rls pi-schedule-prompt /root/.pi/agent/npm --include=package.json | head -1 | grep -q .'"
+
 check_soft "agent-browser --cdp http URL (preferred)" \
   "${COMPOSE} exec -T pi sh -c 'agent-browser --cdp ${CDP_URL} get url'"
 

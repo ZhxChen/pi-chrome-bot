@@ -1,5 +1,6 @@
 {
   "packages": [
-    "npm:pi-agent-browser-native"
+    "npm:pi-agent-browser-native",
+    "npm:pi-schedule-prompt"
   ]
 }

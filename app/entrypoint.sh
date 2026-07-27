@@ -52,39 +52,40 @@ seed_settings="${PI_SEED_DIR}/agent/settings.json"
 cfg_settings="${PI_CONFIG_SRC}/settings.json"
 dest_settings="${PI_AGENT_DIR}/settings.json"
 
-# Ensure browser automation is installed without overriding a user-selected version.
+# Pi packages this deployment always provides (tools: agent_browser, schedule_prompt).
+REQUIRED_PI_PACKAGES="pi-agent-browser-native pi-schedule-prompt"
+
+# Ensure the required packages are listed without overriding user-selected versions.
 sync_settings_packages() {
   local file="$1"
   node -e '
     const fs = require("fs");
     const path = process.argv[1];
+    const required = process.argv[2].split(/\s+/).filter(Boolean);
     let s = {};
     try { s = JSON.parse(fs.readFileSync(path, "utf8")); } catch { s = {}; }
     if (!Array.isArray(s.packages)) s.packages = [];
 
+    const srcOf = (p) => (typeof p === "string" ? p : (p && p.source) || "");
+
     const obsolete = ["pi-package-webui", "@firstpick/pi-package-webui"];
     const before = s.packages.length;
-    s.packages = s.packages.filter((p) => {
-      const src = typeof p === "string" ? p : (p && p.source) || "";
-      return !obsolete.some((name) => src.includes(name));
-    });
+    s.packages = s.packages.filter((p) => !obsolete.some((name) => srcOf(p).includes(name)));
     if (s.packages.length !== before) {
       console.log("entrypoint: removed obsolete firstpick webui package entries from settings.json");
     }
 
-    const hasBrowser = s.packages.some((p) => {
-      const src = typeof p === "string" ? p : (p && p.source) || "";
-      return src.includes("pi-agent-browser-native");
-    });
-    if (!hasBrowser) {
-      s.packages.push("npm:pi-agent-browser-native");
-      console.log("entrypoint: added pi-agent-browser-native to settings.json packages[]");
-    } else {
-      console.log("entrypoint: keeping user-selected pi-agent-browser-native package entry");
+    for (const name of required) {
+      if (s.packages.some((p) => srcOf(p).includes(name))) {
+        console.log(`entrypoint: keeping user-selected ${name} package entry`);
+      } else {
+        s.packages.push(`npm:${name}`);
+        console.log(`entrypoint: added ${name} to settings.json packages[]`);
+      }
     }
 
     fs.writeFileSync(path, JSON.stringify(s, null, 2) + "\n");
-  ' "$file"
+  ' "$file" "$REQUIRED_PI_PACKAGES"
 }
 
 if [ ! -f "$dest_settings" ]; then
@@ -117,19 +118,31 @@ if [ -d "$seed_npm" ]; then
   done
 fi
 
-need_install=0
-if ! find "$PI_AGENT_DIR" -type f -path '*/dist/extensions/agent-browser/index.js' 2>/dev/null | grep -q .; then
-  if ! find "$dest_npm" -type f -name 'package.json' 2>/dev/null \
-      | xargs grep -l '"name"[[:space:]]*:[[:space:]]*"pi-agent-browser-native"' >/dev/null 2>&1; then
-    need_install=1
+pi_package_present() {
+  local name="$1"
+  find "$dest_npm" -type f -name 'package.json' 2>/dev/null \
+    | xargs grep -l "\"name\"[[:space:]]*:[[:space:]]*\"${name}\"" >/dev/null 2>&1
+}
+
+# agent_browser ships its runtime as a bundled extension; accept either marker.
+if find "$PI_AGENT_DIR" -type f -path '*/dist/extensions/agent-browser/index.js' 2>/dev/null | grep -q .; then
+  browser_prebuilt=1
+else
+  browser_prebuilt=0
+fi
+
+for pkg in $REQUIRED_PI_PACKAGES; do
+  if [ "$pkg" = "pi-agent-browser-native" ] && [ "$browser_prebuilt" -eq 1 ]; then
+    continue
   fi
-fi
-if [ "$need_install" -eq 1 ]; then
-  echo "entrypoint: installing missing pi-agent-browser-native (needs network)"
+  if pi_package_present "$pkg"; then
+    continue
+  fi
+  echo "entrypoint: installing missing ${pkg} (needs network)"
   PI_CODING_AGENT_DIR="$PI_AGENT_DIR" \
-    pi install "npm:pi-agent-browser-native" || \
-    echo "entrypoint: WARNING: pi-agent-browser-native install failed" >&2
-fi
+    pi install "npm:${pkg}" || \
+    echo "entrypoint: WARNING: ${pkg} install failed" >&2
+done
 
 if command -v curl >/dev/null 2>&1; then
   if curl -fsS --max-time 3 "${CDP_URL}/json/version" >/dev/null 2>&1; then
@@ -141,7 +154,7 @@ fi
 
 echo "entrypoint: main UX     pi-web  https://<host>:30141/  (via nginx TLS in this container)"
 echo "entrypoint: CDP target  ${CDP_URL}"
-echo "entrypoint: agent tool  agent_browser (pi-agent-browser-native)"
+echo "entrypoint: agent tools agent_browser (pi-agent-browser-native), schedule_prompt (pi-schedule-prompt)"
 
 echo "entrypoint: pi              $(pi --version 2>&1 | head -1 || true)"
 # pi-web has no --version; print package.json version if present
